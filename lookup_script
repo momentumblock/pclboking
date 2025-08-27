@@ -1,0 +1,385 @@
+/** ======================================================================
+ * Port City Luggage — Lookup + Manage API (Apps Script)
+ * (Lean: only endpoints used by the LOOKUP widget)
+ *
+ * Endpoints via doPost JSON body:
+ *   - {fn:'ping'}
+ *   - {fn:'manage_lookup', booking_id:'BKG_XXXX', email:'you@example.com'}
+ *   - {fn:'manage_update_address', booking_id:'BKG_XXXX', email:'you@example.com', dropoff_addr:'..', dropoff_zip:'04101'}
+ *   - {fn:'manage_catalog'}
+ *   - {fn:'extras_checkout', booking_id:'BKG_XXXX', email:'you@example.com', extras:[{id,label,amount}]}
+ *   - {fn:'extras_confirm', booking_id:'BKG_XXXX', session_id:'cs_...'}
+ * ====================================================================== */
+
+const SP = PropertiesService.getScriptProperties();
+
+const CFG = {
+  TZ:                SP.getProperty('TZ') || 'America/New_York',
+  SHEET_ID:          SP.getProperty('SHEET_ID') || null,
+  SHEET_NAME:        SP.getProperty('SHEET_NAME') || 'PCL_Bookings',
+  SLOT_MINUTES:      Number(SP.getProperty('SLOT_MINUTES') || 15),
+  MANAGE_EDIT_MIN_LEAD_MINUTES: Number(SP.getProperty('MANAGE_EDIT_MIN_LEAD_MINUTES') || 90),
+
+  // Extras checkout
+  STRIPE_SECRET_KEY: (SP.getProperty('STRIPE_SECRET_KEY') || '').trim(),
+  MANAGE_URL_BASE:        (SP.getProperty('MANAGE_URL_BASE')        || 'https://www.portcityluggage.com/manage?b=').trim(),
+  MANAGE_SUCCESS_URL_BASE:(SP.getProperty('MANAGE_SUCCESS_URL_BASE')|| SP.getProperty('MANAGE_URL_BASE') || 'https://www.portcityluggage.com/manage?b=').trim(),
+  MANAGE_CANCEL_URL_BASE: (SP.getProperty('MANAGE_CANCEL_URL_BASE') || SP.getProperty('MANAGE_URL_BASE') || 'https://www.portcityluggage.com/manage?b=').trim(),
+
+  // Service area
+  SERVICE_ZIPS_CSV: (SP.getProperty('SERVICE_ZIPS') || '04101,04102')
+};
+
+/* -------- JSON helpers -------- */
+const respond = (o)=>ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+const ok  = (d={})=>Object.assign({ok:true}, d);
+const err = (m,details={})=>Object.assign({ok:false, error:String(m)}, {details});
+
+/* -------- Router -------- */
+function doPost(e){
+  let payload={};
+  try{
+    payload = e && e.postData && e.postData.contents ? JSON.parse(e.postData.contents) : {};
+  }catch(_){ return respond(err('bad_json')); }
+
+  const fn = String(payload.fn||'');
+  try{
+    if (fn === 'ping')                  return respond(ok({ ts: new Date().toISOString() }));
+    if (fn === 'manage_lookup')         return respond(manageLookup_(payload.booking_id, payload.email));
+    if (fn === 'manage_update_address') return respond(manageUpdateAddress_(payload.booking_id, payload.email, payload.dropoff_addr, payload.dropoff_zip));
+    if (fn === 'manage_catalog')        return respond(manageCatalog_());
+    if (fn === 'extras_checkout')       return respond(extrasCheckout_(payload.booking_id, payload.email, payload.extras));
+    if (fn === 'extras_confirm')        return respond(extrasConfirm_(payload.booking_id, payload.session_id));
+    return respond(err('unknown_fn'));
+  }catch(ex){
+    return respond(err('server_exception', { message:String(ex), stack: ex && ex.stack }));
+  }
+}
+
+/* -------- Sheet helpers (never clear; no destructive ops) -------- */
+function openSheet_(){
+  if (!CFG.SHEET_ID) throw new Error('SHEET_ID not set in Script Properties');
+  const ss = SpreadsheetApp.openById(CFG.SHEET_ID);
+  const sh = ss.getSheetByName(CFG.SHEET_NAME);
+  if (!sh) throw new Error('sheet_not_found:'+CFG.SHEET_NAME);
+  return sh;
+}
+function hdrIndex_(sh){
+  const row = sh.getRange(1,1,1,Math.max(1, sh.getLastColumn())).getValues()[0] || [];
+  const map={}; row.forEach((h,i)=>{ if (h !== '') map[String(h)] = i; });
+  return map;
+}
+/** Append header if missing; return its ZERO-based index. Never clears/reorders. */
+function ensureHeaderIndex_(sh, headerName, idxMap){
+  if (idxMap && idxMap[headerName] !== undefined) return idxMap[headerName];
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const headers = sh.getRange(1,1,1,lastCol).getValues()[0] || [];
+  let i = headers.indexOf(headerName);
+  if (i === -1){
+    i = headers.length;
+    sh.getRange(1, i+1).setValue(headerName);
+  }
+  return i;
+}
+
+/* -------- Small time/format helpers -------- */
+function fmtWindow_(iso){
+  if (!iso) return '';
+  const s = new Date(iso);
+  const e = new Date(s.getTime() + CFG.SLOT_MINUTES*60000);
+  const tz = CFG.TZ;
+  return Utilities.formatDate(s, tz, 'h:mma') + '–' + Utilities.formatDate(e, tz, 'h:mma');
+}
+function minutesUntil_(iso){
+  try{
+    const t = new Date(iso).getTime();
+    if (!isFinite(t)) return -1;
+    return Math.round((t - Date.now())/60000);
+  }catch(_){ return -1; }
+}
+function canEditDropoff_(dropoffIso){
+  const mins = minutesUntil_(dropoffIso);
+  return (mins >= CFG.MANAGE_EDIT_MIN_LEAD_MINUTES);
+}
+
+/* -------- Service area helpers -------- */
+function serviceZips_(){
+  const set = new Set();
+  String(CFG.SERVICE_ZIPS_CSV||'').split(',').map(s=>s.trim()).filter(Boolean).forEach(z=>set.add(z.slice(0,5)));
+  return set;
+}
+function normalizeZip_(z){ return String(z||'').slice(0,5); }
+function inServiceZip_(z){
+  const zip = normalizeZip_(z);
+  const S = serviceZips_();
+  if (!S.size) return true;
+  return S.has(zip);
+}
+
+/* -------- Data helpers -------- */
+function parseAddons_(addonsJson){
+  try {
+    const arr = JSON.parse(addonsJson || '[]');
+    return Array.isArray(arr) ? arr.map(x=>({
+      id: String(x.id||''),
+      label: String(x.label || x.id || 'Add-on'),
+      amount: Number(x.amount || 0)
+    })) : [];
+  } catch(_){ return []; }
+}
+function readBookingById_(booking_id){
+  const sh = openSheet_();
+  const idx = hdrIndex_(sh);
+  const rows = sh.getDataRange().getValues();
+  for (let r=1; r<rows.length; r++){
+    if (String(rows[r][idx.booking_id]||'') === String(booking_id||'')){
+      return { sh, idx, rowIndex: r, row: rows[r] };
+    }
+  }
+  return null;
+}
+
+/* -------- Lookup (auth = email matches) -------- */
+function manageLookup_(booking_id, email){
+  if (!booking_id || !email) return err('missing_params',{need:'booking_id,email'});
+  const rec = readBookingById_(booking_id);
+  if (!rec) return err('booking_not_found');
+
+  const { idx, row } = rec;
+  const emailRow = String(row[idx.email]||'').trim().toLowerCase();
+  const emailReq = String(email||'').trim().toLowerCase();
+  if (!emailRow || emailRow !== emailReq) return err('auth_failed');
+
+  const pickupIso  = String(row[idx.pickup_time_iso]||'');
+  const dropoffIso = String(row[idx.dropoff_time_iso]||'');
+
+  const out = {
+    booking_id,
+    status: String(row[idx.status]||''),
+    customer_name: String(row[idx.customer_name]||''),
+    email: emailRow,
+    phone: String(row[idx.phone]||''),
+    bags: Number(row[idx.bags]||0),
+    days: Number(row[idx.days]||1),
+    base_label: String(row[idx.base_label]||''),
+    pickup: { address:String(row[idx.pickup_addr]||''), zip:String(row[idx.pickup_zip]||''), time_iso:pickupIso,  window:fmtWindow_(pickupIso) },
+    dropoff:{ address:String(row[idx.dropoff_addr]||''), zip:String(row[idx.dropoff_zip]||''), time_iso:dropoffIso, window:fmtWindow_(dropoffIso) },
+    addons: parseAddons_(String(row[idx.addons_json]||'[]')),
+    price_cents: Number(row[idx.price_cents]||0),
+    can_edit_dropoff: canEditDropoff_(dropoffIso),
+    now_iso: new Date().toISOString(),
+    min_lead_minutes: CFG.MANAGE_EDIT_MIN_LEAD_MINUTES
+  };
+  return ok({ booking: out });
+}
+
+/* -------- Update drop-off address (write, guarded) -------- */
+function manageUpdateAddress_(booking_id, email, dropoff_addr, dropoff_zip){
+  if (!booking_id || !email) return err('missing_params');
+  if (!dropoff_addr || !dropoff_zip) return err('missing_address');
+
+  const rec = readBookingById_(booking_id);
+  if (!rec) return err('booking_not_found');
+
+  const { sh, idx, rowIndex, row } = rec;
+
+  // auth
+  const emailRow = String(row[idx.email]||'').trim().toLowerCase();
+  const emailReq = String(email||'').trim().toLowerCase();
+  if (!emailRow || emailRow !== emailReq) return err('auth_failed');
+
+  // lead-time rule
+  const dropIso = String(row[idx.dropoff_time_iso]||'');
+  if (!canEditDropoff_(dropIso)) return err('too_late',{min_lead_minutes:CFG.MANAGE_EDIT_MIN_LEAD_MINUTES});
+
+  // service area
+  const zip5 = normalizeZip_(dropoff_zip);
+  if (!inServiceZip_(zip5)) return err('zip_not_in_service',{zip:zip5, service_zips:Array.from(serviceZips_())});
+
+  // write (append headers if missing; never clear)
+  const colAddr = ensureHeaderIndex_(sh, 'dropoff_addr', idx);
+  const colZip  = ensureHeaderIndex_(sh, 'dropoff_zip',  idx);
+  sh.getRange(rowIndex+1, colAddr+1).setValue(String(dropoff_addr).trim());
+  sh.getRange(rowIndex+1, colZip+1).setValue(zip5);
+
+  return ok({
+    dropoff: {
+      address: String(dropoff_addr).trim(),
+      zip: zip5,
+      time_iso: dropIso,
+      window: fmtWindow_(dropIso)
+    }
+  });
+}
+
+/* -------- Extras catalog (overrideable via property) -------- */
+const EXTRAS = new Map(Object.entries({
+  pwm_curb:29, ride_pwm_1_2:49, ride_pwm_3_4:79, priority:12,
+  charger:49, socks:9, earbuds:19, tooth:9, carry40:49, beanbag:59,
+  locks:12, tags:9, neck:29
+}));
+function manageCatalog_(){
+  try{
+    const raw = (SP.getProperty('MANAGE_EXTRAS_CATALOG_JSON')||'').trim();
+    if (raw){
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return ok({ extras: parsed });
+    }
+  }catch(_){}
+  // Default friendly labels
+  return ok({ extras: [
+    { id:'charger', label:'Portable phone charger (USB/USBC, pre-charged)', amount:49 },
+    { id:'socks',   label:'Fresh socks', amount:9 },
+    { id:'earbuds', label:'Wired earbuds', amount:19 },
+    { id:'tooth',   label:'Travel toothbrush kit', amount:9 },
+    { id:'carry40', label:'Collapsible nylon carry-on (40L)', amount:49 },
+    { id:'beanbag', label:'Custom LL Bean PCL Boat & Tote', amount:59 },
+    { id:'locks',   label:'TSA travel lock', amount:12 },
+    { id:'tags',    label:'Luggage tag (2-pack)', amount:9 },
+    { id:'neck',    label:'Neck pillow (the one we love)', amount:29 },
+    { id:'pwm_curb', label:'Portland Jetport Curbside Delivery', amount:29 },
+    { id:'ride_pwm_1_2', label:'Ride to PWM (1–2 people)', amount:49 },
+    { id:'ride_pwm_3_4', label:'Ride to PWM (3–4 people)', amount:79 },
+    { id:'priority', label:'Priority Baggage Pickup', amount:12 }
+  ]});
+}
+
+/* -------- Stripe helpers -------- */
+function buildStripeParams_(items, successUrl, cancelUrl, email, metadata){
+  const parts = [];
+  parts.push('mode=payment');
+  if (email) parts.push('customer_email=' + encodeURIComponent(email));
+  parts.push('success_url=' + encodeURIComponent(successUrl));
+  parts.push('cancel_url='  + encodeURIComponent(cancelUrl));
+  Object.keys(metadata||{}).forEach(k=>{
+    const v = metadata[k]; if (v===undefined || v===null) return;
+    parts.push('metadata['+encodeURIComponent(k)+']=' + encodeURIComponent(String(v)));
+  });
+  items.forEach((it, i)=>{
+    parts.push(`line_items[${i}][price_data][currency]=usd`);
+    parts.push(`line_items[${i}][price_data][product_data][name]=` + encodeURIComponent(String(it.name||'Item').slice(0, 120)));
+    parts.push(`line_items[${i}][price_data][unit_amount]=` + encodeURIComponent(String(it.amount_cents|0)));
+    parts.push(`line_items[${i}][quantity]=` + encodeURIComponent(String(it.qty || 1)));
+  });
+  return parts.join('&');
+}
+
+/* -------- Extras checkout (Stripe session) -------- */
+function extrasCheckout_(booking_id, email, extras){
+  if (!booking_id || !email) return err('missing_params');
+  if (!Array.isArray(extras) || !extras.length) return err('no_extras');
+  if (!CFG.STRIPE_SECRET_KEY) return err('stripe_not_configured', { why:'no_secret_key' });
+
+  const rec = readBookingById_(booking_id);
+  if (!rec) return err('booking_not_found');
+
+  const { idx, row } = rec;
+  const emailRow = String(row[idx.email]||'').trim().toLowerCase();
+  const emailReq = String(email||'').trim().toLowerCase();
+  if (!emailRow || emailRow !== emailReq) return err('auth_failed');
+
+  // Normalize + anti-tamper
+  const normalized = extras.map(x=>{
+    const id = String(x && x.id || '').trim();
+    const label = String((x && x.label) || id || 'Add-on');
+    let amount = Number(x && x.amount);
+    if (!Number.isFinite(amount) || amount<=0) amount = Number(EXTRAS.get(id) || 0);
+    return { id, label, amount };
+  }).filter(x => x.id && x.amount>0);
+  if (!normalized.length) return err('invalid_extras');
+
+  const items = normalized.map(n => ({ name:n.label, amount_cents:Math.round(n.amount*100), qty:1 }));
+
+  const successBase = CFG.MANAGE_SUCCESS_URL_BASE || CFG.MANAGE_URL_BASE;
+  const cancelBase  = CFG.MANAGE_CANCEL_URL_BASE  || CFG.MANAGE_URL_BASE;
+  const successUrl  = `${successBase}${encodeURIComponent(booking_id)}&paid_extras=1&session_id={CHECKOUT_SESSION_ID}`;
+  const cancelUrl   = `${cancelBase}${encodeURIComponent(booking_id)}&cancel_extras=1`;
+
+  const extrasJson = JSON.stringify(normalized);
+  const form = buildStripeParams_(items, successUrl, cancelUrl, emailRow, {
+    booking_id,
+    kind: 'extras',
+    extras_json: extrasJson
+  });
+
+  const resp = UrlFetchApp.fetch('https://api.stripe.com/v1/checkout/sessions',{
+    method:'post',
+    headers:{ Authorization:'Bearer '+CFG.STRIPE_SECRET_KEY },
+    contentType:'application/x-www-form-urlencoded',
+    payload: form,
+    muteHttpExceptions:true,
+  });
+
+  let json; try{ json = JSON.parse(resp.getContentText()); }
+  catch(_){ return err('stripe_response_parse_error',{status:resp.getResponseCode(), body:resp.getContentText()}); }
+  if (json.error) return err('stripe_api_error', json.error);
+
+  return ok({ url: json.url });
+}
+
+/* -------- Confirm extras payment (merge into row) -------- */
+function extrasConfirm_(booking_id, session_id){
+  if (!booking_id || !session_id) return err('missing_params');
+  if (!CFG.STRIPE_SECRET_KEY) return err('stripe_not_configured');
+
+  const rec = readBookingById_(booking_id);
+  if (!rec) return err('booking_not_found');
+
+  const { sh, idx, rowIndex } = rec;
+
+  // Lookup session
+  const resp = UrlFetchApp.fetch(
+    'https://api.stripe.com/v1/checkout/sessions/'+encodeURIComponent(session_id),
+    { method:'get', headers:{ Authorization:'Bearer '+CFG.STRIPE_SECRET_KEY }, muteHttpExceptions:true }
+  );
+  let js; try{ js = JSON.parse(resp.getContentText()); }
+  catch(_){ return err('stripe_lookup_parse_error',{status:resp.getResponseCode(), body:resp.getContentText()}); }
+  if (js.error) return err('stripe_api_error', js.error);
+  if (!((js.payment_status==='paid') || (js.status==='complete'))) {
+    return err('not_paid',{payment_status:js.payment_status, status:js.status});
+  }
+  if (!js.metadata || String(js.metadata.booking_id||'') !== String(booking_id||'')) {
+    return err('metadata_mismatch');
+  }
+
+  let extras;
+  try{
+    extras = JSON.parse(String(js.metadata.extras_json||'[]'));
+    if (!Array.isArray(extras)) extras = [];
+  }catch(_){ extras = []; }
+
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(5000); } catch(_){}
+
+  try{
+    const idxMap = hdrIndex_(sh);
+    const liveRow = sh.getRange(rowIndex+1, 1, 1, sh.getLastColumn()).getValues()[0];
+
+    const curAddons = parseAddons_(String(liveRow[idxMap.addons_json]||'[]'));
+    const merged = curAddons.concat(extras.map(x=>({
+      id:String(x.id||''), label:String(x.label||x.id||'Add-on'), amount:Number(x.amount||0)
+    })));
+
+    // Write merged addons_json
+    const colAddons = ensureHeaderIndex_(sh, 'addons_json', idxMap);
+    sh.getRange(rowIndex+1, colAddons+1).setValue(JSON.stringify(merged));
+
+    // Append to extras_payments_json
+    const colPay = ensureHeaderIndex_(sh, 'extras_payments_json', idxMap);
+    let payArr = [];
+    try{ payArr = JSON.parse(String(liveRow[colPay]||'[]')); if (!Array.isArray(payArr)) payArr=[]; }catch(_){ payArr=[]; }
+    payArr.push({
+      session_id: session_id,
+      paid_at_utc: new Date().toISOString(),
+      amount_total_cents: Number(js.amount_total||0),
+      items: extras
+    });
+    sh.getRange(rowIndex+1, colPay+1).setValue(JSON.stringify(payArr));
+
+  } finally {
+    try{ lock.releaseLock(); }catch(_){}
+  }
+
+  return ok({ merged: true });
+}
+
