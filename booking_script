@@ -1,0 +1,1199 @@
+/** ======================================================================
+ * Port City Luggage — Scheduler + Manage API (Apps Script)
+ * v6.0-backend (hardened, with customer Manage endpoints)
+ *
+ * Endpoints via doPost JSON body:
+ *  Core booking:
+ *   - {fn:'ping'}
+ *   - {fn:'config'}
+ *   - {fn:'availability', date:'YYYY-MM-DD'}
+ *   - {fn:'book', booking:{...}}
+ *   - {fn:'checkout', booking_id:'BKG_XXXX'}
+ *   - {fn:'confirm', booking_id:'BKG_XXXX', session_id:'cs_...'}
+ *
+ *  Manage page (new):
+ *   - {fn:'manage_lookup', booking_id:'BKG_XXXX', email:'you@example.com' }
+ *   - {fn:'manage_update_address', booking_id:'BKG_XXXX', email:'you@example.com', dropoff_addr:'..', dropoff_zip:'04101'}
+ *   - {fn:'manage_catalog'}
+ *   - {fn:'extras_checkout', booking_id:'BKG_XXXX', email:'you@example.com', extras:[{id,label,amount}]}
+ *   - {fn:'extras_confirm', booking_id:'BKG_XXXX', session_id:'cs_...'}
+ *
+ *  Twilio inbound SMS (optional):
+ *   - {fn:'twilio_inbound', form:{...}}  // or direct form POST (no JSON)
+ * ====================================================================== */
+
+const SP = PropertiesService.getScriptProperties();
+const VERSION = 'pcl-2025-08-20';
+
+/* -------- Config (Script Properties, with safe defaults) -------- */
+const CFG = {
+  TZ:                SP.getProperty('TZ') || 'America/New_York',
+  SHEET_ID:          SP.getProperty('SHEET_ID') || null,
+  SHEET_NAME:        SP.getProperty('SHEET_NAME') || 'PCL_Bookings',
+  CAPACITY_PER_SLOT: numProp_('CAPACITY_PER_SLOT', 3),
+  SLOT_MINUTES:      15,
+  OPEN_HOUR:         8,
+  CLOSE_HOUR:        20,
+  LEAD_MINUTES:      60,
+  PENDING_TTL_MIN:   numProp_('PENDING_TTL_MIN', 20),
+
+  STRIPE_SECRET_KEY: SP.getProperty('STRIPE_SECRET_KEY') || '',
+  SUCCESS_URL_BASE:  SP.getProperty('SUCCESS_URL_BASE') || 'https://www.portcityluggage.com/book-1-1/',
+  CANCEL_URL_BASE:   SP.getProperty('CANCEL_URL_BASE')  || 'https://www.portcityluggage.com/book-1-1/',
+
+  // Manage page URLs (for extras-only checkout round-trips)
+  MANAGE_URL_BASE:         SP.getProperty('MANAGE_URL_BASE')         || 'https://www.portcityluggage.com/manage?b=',
+  MANAGE_SUCCESS_URL_BASE: SP.getProperty('MANAGE_SUCCESS_URL_BASE') || SP.getProperty('MANAGE_URL_BASE') || 'https://www.portcityluggage.com/manage?b=',
+  MANAGE_CANCEL_URL_BASE:  SP.getProperty('MANAGE_CANCEL_URL_BASE')  || SP.getProperty('MANAGE_URL_BASE') || 'https://www.portcityluggage.com/manage?b=',
+
+  // ZIP service area (comma-separated)
+  SERVICE_ZIPS_CSV: (SP.getProperty('SERVICE_ZIPS') || '04101,04102'),
+
+  // Manage edits: minimum lead before drop-off to allow address edits
+  MANAGE_EDIT_MIN_LEAD_MINUTES: numProp_('MANAGE_EDIT_MIN_LEAD_MINUTES', 90),
+
+  // Debug/toggles
+  BYPASS_CAPACITY:   boolProp_('BYPASS_CAPACITY', false),
+};
+
+/* -------- Ping / Config -------- */
+function ping_(){ return ok({ ts:new Date().toISOString(), version:VERSION }); }
+function config_(){
+  const sk = (SP.getProperty('STRIPE_SECRET_KEY') || '').trim();
+  return ok({
+    stripe_key_present: !!sk,
+    stripe_key_prefix: sk ? sk.slice(0,7) : '',
+    success_url: CFG.SUCCESS_URL_BASE || null,
+    cancel_url:  CFG.CANCEL_URL_BASE  || null,
+    tz: CFG.TZ,
+    slot_minutes: CFG.SLOT_MINUTES,
+    version: VERSION
+  });
+}
+
+/* -------- Property helpers -------- */
+function numProp_(k, dflt){ const n = Number(SP.getProperty(k)); return Number.isFinite(n) ? n : dflt; }
+function boolProp_(k, dflt){
+  const v = String(SP.getProperty(k)||'').trim().toLowerCase();
+  if (v==='1'||v==='true'||v==='yes') return true;
+  if (v==='0'||v==='false'||v==='no') return false;
+  return dflt;
+}
+
+/* -------- Pricing (mirror of the widget; server-authoritative) -------- */
+const PASS_TIERS = [
+  { id:'solo',    name:'Solo Traveler',        range:'1–2 bags', maxBags:2, day1:49 },
+  { id:'couples', name:'Couples Traveler',     range:'3–4 bags', maxBags:4, day1:99 },
+  { id:'family',  name:'Family Traveler',      range:'5–6 bags', maxBags:6, day1:129 },
+  { id:'large',   name:'Large Group Traveler', range:'7–8 bags', maxBags:8, day1:159 },
+];
+const EXTRA_BAG_DAY1 = 15;
+const EXTRA_BAG_EXTRA_DAY = Math.ceil(EXTRA_BAG_DAY1 * 0.5);
+
+const EXTRAS = new Map(Object.entries({
+  pwm_curb:29, ride_pwm_1_2:49, ride_pwm_3_4:79, priority:12,
+  charger:49, socks:9, earbuds:19, tooth:9, carry40:49, beanbag:59,
+  wrap:19, locks:12, tags:9, neck:29
+}));
+
+function passTierForBags_(bags){
+  const t = PASS_TIERS.find(x => bags <= x.maxBags) || PASS_TIERS[PASS_TIERS.length-1];
+  const extraBags = Math.max(0, bags - 8);
+  return { tier:t, extraBags };
+}
+function passNameForBags_(bags){
+  const r = passTierForBags_(bags);
+  return r.extraBags ? `${r.tier.name} + ${r.extraBags} extra` : r.tier.name;
+}
+function priceForBagsAndDays_(bags, days){
+  const b = Math.max(1, Number(bags)||1);
+  const d = Math.max(1, Number(days)||1);
+  const r = passTierForBags_(b);
+
+  const day1Base   = Number(r.tier.day1) || 0;
+  const day1Extras = r.extraBags * EXTRA_BAG_DAY1;
+  const firstDay   = day1Base + day1Extras;
+
+  const extraDayBase   = Math.ceil(day1Base * 0.5);
+  const extraDayExtras = r.extraBags * EXTRA_BAG_EXTRA_DAY;
+  const perExtraDay    = extraDayBase + extraDayExtras;
+
+  return { tier:r.tier, extraBags:r.extraBags, firstDay, perExtraDay, total:firstDay + (d-1)*perExtraDay };
+}
+function extrasPriceFromBooking_(addons){
+  if (!Array.isArray(addons)) return 0;
+  return addons.reduce((sum,a)=>{
+    const amt = Number(a && a.amount);
+    if (Number.isFinite(amt) && amt>0) return sum + amt;
+    const fallback = EXTRAS.get(String(a && a.id || '')) || 0;
+    return sum + fallback;
+  },0);
+}
+function computeTotalCents_(bags, days, addons){
+  const p  = priceForBagsAndDays_(Number(bags||0), Number(days||0));
+  const ex = extrasPriceFromBooking_(addons);
+  return { base_dollars:p.total, extras_dollars:ex, total_cents:Math.round((p.total+ex)*100), breakdown:p };
+}
+
+/* -------- JSON helpers -------- */
+const respond = (o)=>ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+const ok  = (d={})=>Object.assign({ok:true}, d);
+const err = (m, details={})=>Object.assign({ok:false, error:String(m)}, {details});
+
+/* -------- Router (lean map) -------- */
+function doPost(e) {
+  // Twilio passthrough (unchanged)
+  if (e && e.parameter && e.parameter.From && e.parameter.MessageSid) {
+    if (typeof twilioInbound_ === 'function') return twilioInbound_(e.parameter);
+    return respond(err('twilio_not_enabled'));
+  }
+
+  // --- Accept JSON first ---
+  const ctype = e && e.postData && e.postData.type || '';
+  const raw   = e && e.postData && e.postData.contents || '';
+  try { Logger.log('REQ ctype=%s bytes=%s', ctype, String(raw||'').length); } catch(_){}
+
+  let payload = {};
+  if (raw && /application\/json/i.test(ctype)) {
+    try { payload = JSON.parse(raw); } catch(_) { /* fall through */ }
+  }
+
+  // --- Fallback: accept form posts (from beacon/edge) ---
+  if (!payload || !payload.fn) {
+    const p = (e && e.parameter) || {};
+    if (p && (p.fn || p.booking || p.booking_id || p.session_id)) {
+      payload = { fn: p.fn || '' };
+      if (p.booking)     { try{ payload.booking     = JSON.parse(p.booking); }     catch(_){ payload.booking     = p.booking; } }
+      if (p.extras)      { try{ payload.extras      = JSON.parse(p.extras); }      catch(_){ payload.extras      = p.extras; } }
+      if (p.booking_id)  payload.booking_id = p.booking_id;
+      if (p.session_id)  payload.session_id = p.session_id;
+      if (p.date)        payload.date       = p.date;
+      if (p.which)       payload.which      = p.which;
+      if (p.email)       payload.email      = p.email;
+    }
+  }
+
+  if (!payload || !payload.fn) {
+    try { Logger.log('BAD_JSON_OR_NO_FN head=%s', String(raw||'').slice(0,250)); } catch(_){}
+    return respond(err('bad_json_or_missing_fn'));
+  }
+
+  try {
+    const fn = payload.fn;
+
+    if (fn === 'ping')                  return respond(ping_());
+    if (fn === 'config')                return respond(config_());
+    if (fn === 'availability')          return respond(availability_(payload.date, payload.which));
+    if (fn === 'book')                  return respond(book_(payload.booking));
+    if (fn === 'checkout')              return respond(checkout_(payload.booking_id));
+    if (fn === 'confirm')               return respond(confirm_(payload.booking_id, payload.session_id));
+    if (fn === 'twilio_inbound')        return twilioInbound_(payload.form || {});
+
+    // Manage endpoints (unchanged)
+    if (fn === 'manage_lookup')         return respond(manageLookup_(payload.booking_id, payload.email));
+    if (fn === 'manage_update_address') return respond(manageUpdateAddress_(payload.booking_id, payload.email, payload.dropoff_addr, payload.dropoff_zip));
+    if (fn === 'manage_catalog')        return respond(manageCatalog_());
+    if (fn === 'extras_checkout')       return respond(extrasCheckout_(payload.booking_id, payload.email, payload.extras));
+    if (fn === 'extras_confirm')        return respond(extrasConfirm_(payload.booking_id, payload.session_id));
+
+    return respond(err('unknown_fn'));
+  } catch (ex) {
+    return respond(err('server_exception', { message: String(ex), stack: ex && ex.stack }));
+  }
+}
+
+
+/* -------- Sheet open/create + headers -------- */
+function openOrCreateSheet_(){
+  let ss;
+  if (CFG.SHEET_ID) { try{ ss = SpreadsheetApp.openById(CFG.SHEET_ID); }catch(_){ } }
+  if (!ss){ ss = SpreadsheetApp.create('PCL Bookings'); SP.setProperty('SHEET_ID', ss.getId()); }
+  let sh = ss.getSheetByName(CFG.SHEET_NAME);
+  if (!sh) sh = ss.insertSheet(CFG.SHEET_NAME);
+  ensureHeaders_(sh);
+  return sh;
+}
+function ensureHeaders_(sh){
+  const headers = [
+    'timestamp_utc','status','booking_id',
+    'customer_name','email','phone',
+    'bags','days','base_label',
+    'pickup_time_iso','pickup_slot_local','pickup_addr','pickup_zip',
+    'dropoff_time_iso','dropoff_slot_local','dropoff_addr','dropoff_zip',
+    'addons_json','notes','price_cents',
+    'stripe_session_id','paid_at_utc',
+    'sms_owner_sent','sms_cust_sent',
+    'slack_paid_sent_utc',
+    'email_cust_sent','notified_at_utc','extras_payments_json'
+  ];
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const firstRowVals = sh.getRange(1,1,1,lastCol).getValues()[0] || [];
+  const rowIsEmpty = firstRowVals.every(v => String(v||'').trim()==='');
+
+  if (rowIsEmpty){
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+    return;
+  }
+  const existing = firstRowVals.map(v => String(v||''));
+  let colPtr = existing.length;
+  headers.forEach(h=>{
+    if (!existing.includes(h)){
+      sh.getRange(1, colPtr+1).setValue(h);
+      existing.push(h);
+      colPtr++;
+    }
+  });
+  if (sh.getFrozenRows() < 1) sh.setFrozenRows(1);
+}
+function hdrIndex_(sh){
+  const row = sh.getRange(1,1,1,Math.max(1,sh.getLastColumn())).getValues()[0] || [];
+  const map = {}; for (let i=0;i<row.length;i++){ if (row[i]) map[row[i]] = i; }
+  return map;
+}
+
+/* -------- TTL cleanup for PENDING holds -------- */
+function cleanupExpired_(sh){
+  const idx = hdrIndex_(sh); if (!idx.status || !idx.timestamp_utc) return;
+  const rng = sh.getDataRange().getValues(); if (rng.length<=1) return;
+  const now = Date.now(), ttl = Math.max(1, CFG.PENDING_TTL_MIN)*60*1000;
+  for (let r=1;r<rng.length;r++){
+    if (String(rng[r][idx.status]||'')!=='PENDING') continue;
+    const ts = rng[r][idx.timestamp_utc]; const t = ts ? new Date(ts).getTime() : 0;
+    if (t && (now-t)>ttl) sh.getRange(r+1, idx.status+1).setValue('EXPIRED');
+  }
+}
+
+/* -------- Time helpers -------- */
+function isoToLocalKey_(iso){
+  const d = iso ? new Date(iso) : null;
+  if (!d || isNaN(d)) return '';
+  const tz = CFG.TZ, pad = (n)=>('0'+n).slice(-2);
+  const y=Utilities.formatDate(d,tz,'yyyy'), M=Utilities.formatDate(d,tz,'MM'), D=Utilities.formatDate(d,tz,'dd');
+  const H=Utilities.formatDate(d,tz,'HH'), m=Number(Utilities.formatDate(d,tz,'mm'));
+  const mm = pad(Math.floor(m/CFG.SLOT_MINUTES)*CFG.SLOT_MINUTES);
+  return `${y}-${M}-${D}T${H}:${mm}`;
+}
+
+/*-------timezone shift---------*/
+function localISO_(dateISO, hour, minute){
+  const [y, M, d] = String(dateISO || '').split('-').map(Number);
+  const tz = CFG.TZ || 'America/New_York';
+  const HH = ('0' + (hour || 0)).slice(-2);
+  const mm = ('0' + (minute || 0)).slice(-2);
+  // Build a local wall-time with the correct ET offset for that date
+  const probeUtc = new Date(Date.UTC(y||1970,(M||1)-1,d||1,hour||0,minute||0,0,0));
+  const off = tzOffsetIso_(probeUtc, tz); // e.g. "-04:00"
+  const stamped = `${(''+(y||1970)).padStart(4,'0')}-${(''+(M||1)).padStart(2,'0')}-${(''+(d||1)).padStart(2,'0')}T${HH}:${mm}:00${off}`;
+  return new Date(stamped).toISOString(); // true instant
+}
+
+
+function tzOffsetIso_(d, tz){
+  // Returns "-04:00" style offset for the given Date in the provided tz
+  const z = Utilities.formatDate(d, tz, 'Z'); // e.g. "-0400"
+  return z.slice(0,3) + ':' + z.slice(3);
+}
+
+
+/* -------- Availability (PAID-only, cached ~60s, single-pass) -------- */
+
+// Small cache helpers
+function _cache_(){ return CacheService.getScriptCache(); }
+function _countsKey_(dateISO){
+  // Include TZ, slot minutes, capacity in key so changes don't reuse stale
+  const v='v3';
+  return ['pcl','counts',v, CFG.TZ, CFG.SLOT_MINUTES, CFG.CAPACITY_PER_SLOT, String(dateISO||'')].join('|');
+}
+// Convert an instant to local date (yyyy-MM-dd) in CFG.TZ
+function _localDate_(iso){
+  if (!iso) return '';
+  return Utilities.formatDate(new Date(iso), CFG.TZ, 'yyyy-MM-dd');
+}
+
+// Compute (or fetch from cache) PAID counts for a given local date
+function getDayCounts_(sh, dateISO){
+  const cache = _cache_(), key = _countsKey_(dateISO);
+  const hit = cache.get(key);
+  if (hit) {
+    try { return JSON.parse(hit); } catch(_) {}
+  }
+
+  const idx = hdrIndex_(sh);
+  const stCol = idx.status, puCol = idx.pickup_time_iso, doCol = idx.dropoff_time_iso;
+  const last  = sh.getLastRow();
+  const prefix = String(dateISO).trim() + 'T';
+
+  const pick = Object.create(null), drop = Object.create(null);
+
+  if (last >= 2 && stCol !== undefined){
+    const n = last - 1;
+    const statuses = sh.getRange(2, stCol+1, n, 1).getValues();
+    const puVals   = (puCol!==undefined) ? sh.getRange(2, puCol+1, n, 1).getValues() : [];
+    const doVals   = (doCol!==undefined) ? sh.getRange(2, doCol+1, n, 1).getValues() : [];
+
+    for (let i=0; i<n; i++){
+      const st = String(statuses[i][0]||'').toUpperCase();
+      if (st !== 'PAID') continue;
+
+      const pu = puVals[i] && puVals[i][0]; if (pu) {
+        const kp = isoToLocalKey_(pu);
+        if (kp && kp.startsWith(prefix)) pick[kp] = (pick[kp]||0)+1;
+      }
+      const dv = doVals[i] && doVals[i][0]; if (dv) {
+        const kd = isoToLocalKey_(dv);
+        if (kd && kd.startsWith(prefix)) drop[kd] = (drop[kd]||0)+1;
+      }
+    }
+  }
+
+  const res = { pick, drop, ts: Date.now() };
+  try { cache.put(key, JSON.stringify(res), 60); } catch(_){}
+  return res;
+}
+
+// Invalidate cache for a date (called on confirm)
+function invalidateCountsForDate_(iso){
+  const d = _localDate_(iso); if (!d) return;
+  try { _cache_().remove(_countsKey_(d)); } catch(_){}
+}
+
+function availability_(dateISO, which){
+  if (!dateISO) return err('missing_date');
+
+  // Build candidate slots for the whole day
+  const all = [];
+  for (let h=CFG.OPEN_HOUR; h<CFG.CLOSE_HOUR; h++){
+    for (let m=0; m<60; m+=CFG.SLOT_MINUTES){
+      all.push({ start: localISO_(dateISO, h, m) });
+    }
+  }
+  const leadCutoffMs = Date.now() + CFG.LEAD_MINUTES*60000;
+  const slots = all.filter(s => new Date(s.start).getTime() >= leadCutoffMs);
+
+  // Pull (cached) counts for this date
+  const sh = openOrCreateSheet_(); cleanupExpired_(sh);
+  const counts = getDayCounts_(sh, dateISO);
+  const pick = counts.pick || {};
+  const drop = counts.drop || {};
+
+  // Single-car rule — combined pickups + drop-offs
+  const cap = (CFG.CAPACITY_PER_SLOT>0) ? CFG.CAPACITY_PER_SLOT : 3;
+
+  const available_keys = slots
+    .map(s => isoToLocalKey_(s.start))
+    .filter(k => {
+      if (!k) return false;
+      const total = (pick[k]||0) + (drop[k]||0);
+      return total < cap;
+    });
+
+  return ok({ slots, available_keys, tz: CFG.TZ, slot_minutes: CFG.SLOT_MINUTES });
+}
+
+
+
+/**
+ * scanCountsForDate_
+ * Builds a key→count map for a given local date in CFG.TZ using PAID rows only,
+ * combining pickup + dropoff in the same 15-minute window.
+ */
+function scanCountsForDate_(sh, dateISO){
+  const idx = hdrIndex_(sh);
+  const stIdx = idx.status, puIdx = idx.pickup_time_iso, doIdx = idx.dropoff_time_iso;
+  if (stIdx === undefined || (puIdx === undefined && doIdx === undefined)) return new Map();
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return new Map();
+
+  const stCol = stIdx + 1, puCol = puIdx + 1, doCol = doIdx + 1;
+  const numRows = lastRow - 1;
+
+  // Read only the three columns we need
+  const statusVals = sh.getRange(2, stCol, numRows, 1).getValues();                // [[status], ...]
+  const puVals = (puIdx !== undefined) ? sh.getRange(2, puCol, numRows, 1).getValues() : null; // [[iso], ...]
+  const doVals = (doIdx !== undefined) ? sh.getRange(2, doCol, numRows, 1).getValues() : null; // [[iso], ...]
+
+  const keyPrefix = String(dateISO).trim() + 'T'; // matches isoToLocalKey_ format
+  const map = new Map();
+
+  for (let i = 0; i < numRows; i++){
+    const st = String(statusVals[i][0] || '').toUpperCase();
+    if (st !== 'PAID') continue; // PAID-only policy
+
+    if (puVals){
+      const v = puVals[i][0];
+      if (v){
+        const k = isoToLocalKey_(v);
+        if (k && k.startsWith(keyPrefix)) map.set(k, (map.get(k) || 0) + 1);
+      }
+    }
+    if (doVals){
+      const v = doVals[i][0];
+      if (v){
+        const k = isoToLocalKey_(v);
+        if (k && k.startsWith(keyPrefix)) map.set(k, (map.get(k) || 0) + 1);
+      }
+    }
+  }
+  return map;
+}
+
+/* -------- Capacity helpers (PAID-only, combined; fast per-checkout) -------- */
+function hasCapacity_(sh, iso, which){
+  // which is ignored intentionally — capacity is combined across pickup+dropoff
+  const dateISO = Utilities.formatDate(new Date(iso), CFG.TZ, 'yyyy-MM-dd');
+  const key = isoToLocalKey_(iso);
+  const counts = scanCountsForDate_(sh, dateISO);
+  const count = counts.get(key) || 0;
+  const cap   = (CFG.CAPACITY_PER_SLOT > 0) ? CFG.CAPACITY_PER_SLOT : 3;
+  return { available: count < cap, count, cap, key };
+}
+
+// Backward-compat shim; route to hasCapacity_ so callers still work
+function slotCountGeneric_(sh, iso, which, stopAt){
+  const idx = hdrIndex_(sh);
+  const stCol = idx.status, puCol = idx.pickup_time_iso, doCol = idx.dropoff_time_iso;
+  if (stCol===undefined || (puCol===undefined && doCol===undefined)) return 0;
+
+  const key = isoToLocalKey_(iso); if (!key) return 0;
+  const values = sh.getDataRange().getValues(); if (values.length<=1) return 0;
+
+  const now = Date.now(), ttl = Math.max(1, CFG.PENDING_TTL_MIN)*60*1000, tsCol = idx.timestamp_utc;
+  let n=0;
+  const check = (val)=> (val && isoToLocalKey_(val)===key);
+  const cutoff = Number.isFinite(stopAt) ? Math.max(0, stopAt) : Infinity;
+
+  for (let r=1;r<values.length;r++){
+    const st = String(values[r][stCol]||'').toUpperCase();
+    if (st==='CANCELLED' || st==='EXPIRED') continue;
+    if (st==='PENDING' && tsCol!==undefined){
+      const t = values[r][tsCol] ? new Date(values[r][tsCol]).getTime() : 0;
+      if (t && (now - t) > ttl) continue;
+    }
+    if (which==='pickup') { if (check(values[r][puCol])) n++; }
+    else if (which==='dropoff') { if (check(values[r][doCol])) n++; }
+    else {
+      if (puCol!==undefined && check(values[r][puCol])) n++;
+      if (doCol!==undefined && check(values[r][doCol])) n++;
+    }
+    if (n >= cutoff) break; // early exit when we already hit capacity
+  }
+  return n;
+}
+
+
+
+/* -------- BOOK -------- */
+function book_(b) {
+  try {
+    Logger.log(
+      'BOOK start name=%s email=%s pu=%s do=%s',
+      b && b.customer_name,
+      b && b.email,
+      b && b.pickup_time_iso,
+      b && b.dropoff_time_iso
+    );
+  } catch (_) {}
+
+  if (!b) return err('missing_booking');
+  const req = ['customer_name','email','phone','bags','days','pickup_time_iso','dropoff_time_iso','pickup_addr','dropoff_addr'];
+  for (const k of req){ if (b[k]===undefined || b[k]===null || String(b[k]).trim()==='') return err('missing_field:'+k); }
+
+  const sh = openOrCreateSheet_(); cleanupExpired_(sh);
+
+  const serverDays = daysFromIso_(b.pickup_time_iso, b.dropoff_time_iso);
+  const price = computeTotalCents_(Number(b.bags||0), serverDays, b.addons||[]);
+  const id = 'BKG_' + Utilities.getUuid().slice(0,8).toUpperCase();
+  const passLabel = (b.base_label && String(b.base_label).trim()) ? String(b.base_label).trim() : passNameForBags_(Number(b.bags||0));
+
+  const row = [
+    new Date().toISOString(), 'PENDING', id,
+    String(b.customer_name||''), String(b.email||''), String(b.phone||''),
+    Number(b.bags||0), Number(serverDays||1), passLabel,
+    String(b.pickup_time_iso||''), isoToLocalKey_(b.pickup_time_iso), String(b.pickup_addr||''), String(b.pickup_zip||''),
+    String(b.dropoff_time_iso||''), isoToLocalKey_(b.dropoff_time_iso), String(b.dropoff_addr||''), String(b.dropoff_zip||''),
+    JSON.stringify(b.addons||[]), String(b.notes||''), Number(price.total_cents),
+    '', '', // stripe_session_id, paid_at_utc
+    '', ''  // sms_owner_sent, sms_cust_sent
+  ];
+    sh.appendRow(row);
+  try {
+    Logger.log('BOOK appended id=%s sheet=%s', id, CFG.SHEET_ID);
+  } catch (_) {}
+
+
+  // 🔔 NEW: server-side creation ping so Slack always has a Pending parent
+  try { notifySlack_('booking_created', id); } catch(_){}
+
+  // (Owner SMS optional — left commented to avoid adding latency)
+  /*
+  try{
+    const idx = hdrIndex_(sh), lastRow = sh.getLastRow();
+    const rec = sh.getRange(lastRow, 1, 1, sh.getLastColumn()).getValues()[0];
+    const opsPhone = (SP.getProperty('OPS_PHONE')||'').trim();
+    if (opsPhone){
+      const text = formatOwnerSMS_(rec, idx);
+      const sent = sendSMS_(opsPhone, text);
+      if (sent && idx.sms_owner_sent !== undefined) sh.getRange(lastRow, idx.sms_owner_sent+1).setValue(new Date().toISOString());
+    }
+  }catch(_){}
+  */
+
+  return ok({ booking_id:id, price_cents:price.total_cents });
+}
+
+
+
+/* -------- CHECKOUT (Stripe) -------- */
+function checkout_(booking_id, prewarm){
+  if (!booking_id) return err('missing_booking_id');
+  const t0 = Date.now();
+
+  const STRIPE_SECRET_KEY = (SP.getProperty('STRIPE_SECRET_KEY') || '').trim();
+  const BYPASS_CAPACITY   = ((SP.getProperty('BYPASS_CAPACITY')||'').toLowerCase() === '1');
+  if (!STRIPE_SECRET_KEY) return err('stripe_not_configured', { why:'no_secret_key' });
+
+  const sh = openOrCreateSheet_(), idx = hdrIndex_(sh);
+  const rFound = findRowByBookingId_(sh, idx, booking_id);
+  if (rFound < 0) return err('booking_not_found');
+
+  const row = sh.getRange(rFound, 1, 1, sh.getLastColumn()).getValues()[0];
+  const status = String(row[idx.status]||'').toUpperCase();
+  const email  = String(row[idx.email]||'');
+  const puIso  = String(row[idx.pickup_time_iso]||'');
+  const doIso  = String(row[idx.dropoff_time_iso]||'');
+  const bags   = Number(row[idx.bags]||1);
+  const days   = Number(row[idx.days]||1);
+  const addonsJson = String(row[idx.addons_json]||'[]');
+
+  if (status!=='PENDING') return err('invalid_status',{status});
+
+  // Capacity check with early-exit; stop after reaching cap
+  if (!BYPASS_CAPACITY){
+    const cap = Math.max(1, CFG.CAPACITY_PER_SLOT || 3);
+    const need = cap; // we only care whether we hit cap
+    const puCount = slotCountGeneric_(sh, puIso, 'any', need);
+    const doCount = slotCountGeneric_(sh, doIso, 'any', need);
+    if (puCount >= cap) return err('slot_full',{where:'pickup',key:isoToLocalKey_(puIso),count:puCount,cap});
+    if (doCount >= cap) return err('slot_full',{where:'dropoff',key:isoToLocalKey_(doIso),count:doCount,cap});
+  }
+
+  // If we already have a session id, reuse it (retrieve URL quickly)
+  let sessId = String(row[idx.stripe_session_id]||'').trim();
+  if (sessId){
+    const url = stripeCheckoutUrlFromId_(STRIPE_SECRET_KEY, sessId);
+    if (url) { try{ console.log('checkout_reuse_ms=', Date.now()-t0); }catch(_){}
+      return ok({ url });
+    }
+    // fallthrough: session might be expired or invalid; create a new one
+  }
+
+  // Build a fresh session (warm or click)
+  const p = priceForBagsAndDays_(bags, days);
+  const addons = parseAddons_(addonsJson);
+  const _bags = Math.max(1, Number(bags||0)||1), _days = Math.max(1, Number(days||0)||1);
+  const baseName = `${passNameForBags_(_bags)} — ${_bags} ${_bags===1?'bag':'bags'} — ${_days} ${_days===1?'day':'days'}`;
+  const items = [{ name:baseName, amount_cents:Math.round(p.total*100), qty:1 }];
+  addons.forEach(a=>{ const amt=Number(a.amount||0); if (amt>0) items.push({ name:String(a.label||a.id||'Add-on'), amount_cents:Math.round(amt*100), qty:1 }); });
+
+  const successUrl = `${CFG.SUCCESS_URL_BASE}?paid=1&bid=${encodeURIComponent(booking_id)}&session_id={CHECKOUT_SESSION_ID}`;
+  const cancelUrl  = `${CFG.CANCEL_URL_BASE}?cancel=1&bid=${encodeURIComponent(booking_id)}`;
+
+  const form = buildStripeParams_(items, successUrl, cancelUrl, email, {
+    booking_id, debug_bags:String(_bags), debug_days:String(_days), debug_base:baseName
+  });
+
+  const resp = UrlFetchApp.fetch('https://api.stripe.com/v1/checkout/sessions',{
+    method:'post', headers:{ Authorization:'Bearer '+STRIPE_SECRET_KEY },
+    contentType:'application/x-www-form-urlencoded', payload: form, muteHttpExceptions:true,
+  });
+
+  let json; try{ json = JSON.parse(resp.getContentText()); }
+  catch(_){ return err('stripe_response_parse_error',{status:resp.getResponseCode(), body:resp.getContentText()}); }
+  if (json.error) return err('stripe_api_error', json.error);
+
+  // Persist session id for reuse; URL is returned immediately
+  sh.getRange(rFound, idx.stripe_session_id+1).setValue(json.id||'');
+  try{ console.log('checkout_new_ms=', Date.now()-t0, 'prewarm=', !!prewarm); }catch(_){}
+  return ok({ url: json.url });
+}
+
+/* Retrieve an existing Checkout session's URL by id (fast path) */
+function stripeCheckoutUrlFromId_(secretKey, sessionId){
+  try{
+    const url = 'https://api.stripe.com/v1/checkout/sessions/' + encodeURIComponent(sessionId);
+    const res = UrlFetchApp.fetch(url, { method:'get', headers:{ Authorization:'Bearer '+secretKey }, muteHttpExceptions:true });
+    if (res.getResponseCode() !== 200) return '';
+    const j = JSON.parse(res.getContentText());
+    return j && j.url ? String(j.url) : '';
+  }catch(_){ return ''; }
+}
+
+
+/* -------- CONFIRM (idempotent + locked notify, Stripe-verified) -------- */
+function confirm_(booking_id, session_id){
+  if (!booking_id || !session_id) return err('missing_params');
+
+  const sh  = openOrCreateSheet_();
+  const idx = hdrIndex_(sh);
+  const rows = sh.getDataRange().getValues();
+
+  let rFound = -1;
+  for (let r=1; r<rows.length; r++){
+    if (String(rows[r][idx.booking_id]||'') === String(booking_id||'')){ rFound = r; break; }
+  }
+  if (rFound < 0) return err('booking_not_found');
+
+  const check = verifyStripeSessionPaid_(session_id);
+  if (!check.ok) return err('not_paid', check);
+
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(5000); } catch(_){}
+
+  let latest;
+  try{
+    latest = sh.getRange(rFound+1, 1, 1, sh.getLastColumn()).getValues()[0];
+
+    // 1) Mark PAID + persist session id (idempotent)
+    const statusNow = String(latest[idx.status]||'');
+    if (statusNow !== 'PAID') {
+      sh.getRange(rFound+1, idx.status+1).setValue('PAID');
+      sh.getRange(rFound+1, idx.paid_at_utc+1).setValue(new Date().toISOString());
+    }
+    if (idx.stripe_session_id !== undefined) {
+      const curSess = String(latest[idx.stripe_session_id]||'');
+      if (!curSess) sh.getRange(rFound+1, idx.stripe_session_id+1).setValue(String(session_id));
+    }
+
+    // Refresh latest after writes
+    latest = sh.getRange(rFound+1, 1, 1, sh.getLastColumn()).getValues()[0];
+
+    // 🔄 Invalidate cached day counts for pickup & drop-off dates (so UI refresh sees the slot closed)
+    try {
+      const puIso = String(latest[idx.pickup_time_iso]||'');
+      const doIso = String(latest[idx.dropoff_time_iso]||'');
+      if (puIso) invalidateCountsForDate_(puIso);
+      if (doIso) invalidateCountsForDate_(doIso);
+    } catch(_){}
+
+    // 2) Notify (email/SMS/Slack)
+    notifyPaid_(latest, idx);
+    let slackPaidCol = idx.slack_paid_sent_utc;
+    if (slackPaidCol === undefined) slackPaidCol = ensureHeaderIndex_(sh, 'slack_paid_sent_utc', idx);
+    const already = String(sh.getRange(rFound+1, slackPaidCol+1).getValue()||'').trim();
+    if (!already){
+      try{
+        notifySlack_('booking_paid', String(booking_id||''));
+        sh.getRange(rFound+1, slackPaidCol+1).setValue(new Date().toISOString());
+      }catch(_){}
+    }
+
+    // 3) Return a compact booking summary so the widget can render the end page
+    const summary = buildPublicBooking_(latest, idx);
+    return ok({ confirmed:true, booking: summary });
+
+  } finally {
+    try { lock.releaseLock(); } catch(_){}
+  }
+}
+
+
+
+/* -------- Small helpers -------- */
+function form_(obj){
+  const parts=[]; Object.keys(obj).forEach(k=>{ if (obj[k]!==undefined && obj[k]!==null) parts.push(encodeURIComponent(k)+'='+encodeURIComponent(String(obj[k]))); });
+  return parts.join('&');
+}
+function findRowByBookingId_(sh, idx, booking_id){
+  const col = idx.booking_id + 1, last = sh.getLastRow();
+  if (last < 2) return -1;
+  const rng = sh.getRange(2, col, last - 1, 1);
+  const tf  = rng.createTextFinder(String(booking_id)).matchEntireCell(true);
+  const cell = tf.findNext();
+  return cell ? cell.getRow() : -1;
+}
+function fetchWithRetry_(url, options, retries, backoffMs){
+  var attempt=0, wait=Math.max(0,Number(backoffMs)||0), last;
+  while(true){
+    try{
+      last = UrlFetchApp.fetch(url, options);
+      var code = last.getResponseCode();
+      if (code>=200 && code<300) return last;
+      if (!retries || (code<500 && code!==429)) return last;
+    }catch(ex){ if (!retries) throw ex; }
+    Utilities.sleep(wait); wait = Math.min(2000, wait ? Math.floor(wait*2) : 250);
+    retries--; attempt++;
+  }
+}
+
+/* -------- Slack helpers -------- */
+function notifySlack_(type, booking_id){
+  const url    = (SP.getProperty('SLACK_AUTOMATIONS_URL')||'').trim();
+  const secret = (SP.getProperty('INBOUND_SECRET')||'').trim();
+  if (!(url && secret && booking_id)) return;
+  UrlFetchApp.fetch(url, {
+    method:'post',
+    contentType:'application/json',
+    payload: JSON.stringify({ type, booking_id, secret }),
+    muteHttpExceptions:true
+  });
+}
+
+/* ---------- SMS formatters ---------- */
+function formatOwnerSMS_(record, idx){
+  const id   = String(record[idx.booking_id]||'');
+  const name = String(record[idx.customer_name]||'');
+  const bags = Number(record[idx.bags]||0), days = Number(record[idx.days]||1);
+  const puWin = fmtWindow_(String(record[idx.pickup_time_iso]||'')), puAdr = String(record[idx.pickup_addr]||'').slice(0,120);
+  const doWin = fmtWindow_(String(record[idx.dropoff_time_iso]||'')), doAdr = String(record[idx.dropoff_addr]||'').slice(0,120);
+  const price = Number(record[idx.price_cents]||0)/100;
+
+  return [
+    `📦 New PENDING ${id}`,
+    `${name} — ${bags} bag${bags===1?'':'s'}/${days} day${days===1?'':'s'}`,
+    `PU ${puWin} @ ${puAdr}`,
+    `DO ${doWin} @ ${doAdr}`,
+    price>0 ? `Est $${price.toFixed(2)}` : ''
+  ].filter(Boolean).join('\n');
+}
+function formatCustomerPaidSMS_(record, idx){
+  const id    = String(record[idx.booking_id]||'');
+  const puWin = fmtWindow_(String(record[idx.pickup_time_iso]||'')); const puAdr = String(record[idx.pickup_addr]||'').slice(0,120);
+  const doWin = fmtWindow_(String(record[idx.dropoff_time_iso]||'')); const doAdr = String(record[idx.dropoff_addr]||'').slice(0,120);
+  return [
+    `✅ Port City Luggage: Booking confirmed (${id}).`,
+    `Pickup ${puWin} @ ${puAdr}`,
+    `Return ${doWin} @ ${doAdr}`,
+    `Reply to this text for changes or help.`
+  ].join('\n');
+}
+
+/* ========= Utilities for selection ========= */
+function getSelectedRowIndexes_(sh){
+  const sel = sh.getSelection ? sh.getSelection() : null;
+  if (!sel) return [];
+  const rows = new Set();
+  const rl = sel.getActiveRangeList && sel.getActiveRangeList();
+  if (rl){
+    rl.getRanges().forEach(r=>{
+      const r1 = r.getRow(), r2 = r1 + r.getNumRows() - 1;
+      for (let i=Math.max(2,r1); i<=r2; i++) rows.add(i);
+    });
+  } else {
+    const r = sel.getActiveRange && sel.getActiveRange();
+    if (r){ const r1=Math.max(2,r.getRow()), r2=r1+r.getNumRows()-1; for (let i=r1;i<=r2;i++) rows.add(i); }
+  }
+  return Array.from(rows).sort((a,b)=>a-b);
+}
+
+/* ========= Main menu action ========= */
+function resendMissingSMSForSelection_(){
+  const ui = SpreadsheetApp.getUi();
+  const sh = openOrCreateSheet_();
+  const idx = hdrIndex_(sh);
+
+  const sp = SP;
+  const OPS_PHONE = (sp.getProperty('OPS_PHONE')||'').trim();
+  const SID   = (sp.getProperty('TWILIO_SID')   || '').trim();
+  const TOKEN = (sp.getProperty('TWILIO_TOKEN') || '').trim();
+  const FROM  = (sp.getProperty('TWILIO_FROM')  || '').trim();
+
+  if (!(SID && TOKEN && FROM)) { ui.alert('Twilio is not configured','Set TWILIO_SID, TWILIO_TOKEN, and TWILIO_FROM in Script properties.', ui.ButtonSet.OK); return; }
+  if (!OPS_PHONE){ ui.alert('Note: OPS_PHONE not set','Owner alerts will be skipped. Set OPS_PHONE in Script properties to enable.', ui.ButtonSet.OK); }
+
+  const rowIdxs = getSelectedRowIndexes_(sh);
+  if (!rowIdxs.length){ ui.alert('No rows selected','Select one or more data rows and try again.', ui.ButtonSet.OK); return; }
+
+  const confirm = ui.alert('Resend Missing SMS',
+    `We will scan ${rowIdxs.length} row(s) and send:\n• Owner alert if status=PENDING and sms_owner_sent is empty\n• Customer confirmation if status=PAID and sms_cust_sent is empty\n\nProceed?`,
+    ui.ButtonSet.OK_CANCEL);
+  if (confirm !== ui.Button.OK) return;
+
+  const values = sh.getDataRange().getValues();
+  let sentOwner=0, sentCust=0, skipped=0, errors=0;
+
+  rowIdxs.forEach(r=>{
+    try{
+      const row = values[r-1];
+      const status = String(row[idx.status]||'').toUpperCase();
+      const bookingId = String(row[idx.booking_id]||'');
+      if (!bookingId){ skipped++; return; }
+
+      if (status==='PENDING' && OPS_PHONE && idx.sms_owner_sent!==undefined){
+        const alreadyOwner = String(row[idx.sms_owner_sent]||'').trim();
+        if (!alreadyOwner){
+          const ok = sendSMS_(OPS_PHONE, formatOwnerSMS_(row, idx));
+          if (ok){ sh.getRange(r, idx.sms_owner_sent+1).setValue(new Date().toISOString()); sentOwner++; }
+        }
+      }
+      if (status==='PAID' && idx.sms_cust_sent!==undefined){
+        const alreadyCust = String(row[idx.sms_cust_sent]||'').trim();
+        const to = String(row[idx.phone]||'');
+        if (!alreadyCust && to.startsWith('+')){
+          const ok = sendSMS_(to, formatCustomerPaidSMS_(row, idx));
+          if (ok){ sh.getRange(r, idx.sms_cust_sent+1).setValue(new Date().toISOString()); sentCust++; }
+        }
+      }
+    }catch(_){ errors++; }
+  });
+
+  ui.alert('Resend Missing SMS — Done',
+    `Owner alerts sent: ${sentOwner}\nCustomer confirmations sent: ${sentCust}\nSkipped: ${skipped}\nErrors: ${errors}`,
+    ui.ButtonSet.OK);
+}
+
+/* --------- ADDITIONAL HELPERS ---------*/
+function daysFromIso_(puIso, doIso){
+  try{
+    var s = new Date(puIso).getTime(), e = new Date(doIso).getTime();
+    if (!isFinite(s) || !isFinite(e) || e <= s) return 1;
+    return Math.max(1, Math.ceil((e - s) / (24*60*60*1000)));
+  }catch(_){ return 1; }
+}
+function ensureHeaderIndex_(sh, headerName, idxMap){
+  if (idxMap && idxMap[headerName] !== undefined) return idxMap[headerName];
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const headers = sh.getRange(1,1,1,lastCol).getValues()[0];
+  let i = headers.indexOf(headerName);
+  if (i === -1){ i = headers.length; sh.getRange(1, i+1).setValue(headerName); }
+  return i;
+}
+
+/* Stripe session verification */
+function verifyStripeSessionPaid_(sessionId){
+  if (!sessionId) return { ok:false, error:'NO_SESSION_ID' };
+  const key = SP.getProperty('STRIPE_SECRET_KEY');
+  if (!key) return { ok:false, error:'NO_STRIPE_KEY' };
+
+  const url = 'https://api.stripe.com/v1/checkout/sessions/' + encodeURIComponent(sessionId) + '?expand[]=payment_intent';
+  const res = UrlFetchApp.fetch(url, { method:'get', headers:{ Authorization:'Bearer '+key }, muteHttpExceptions:true });
+  if (res.getResponseCode() !== 200) return { ok:false, error:'STRIPE_FETCH_FAIL', code:res.getResponseCode(), body:res.getContentText() };
+
+  const session = JSON.parse(res.getContentText());
+  const paid = session && session.payment_status === 'paid';
+  const piOk = session.payment_intent && session.payment_intent.status === 'succeeded';
+  if (paid && (piOk || !session.payment_intent)) return { ok:true, session };
+  return { ok:false, error:'NOT_PAID_YET', session_status:session.status, payment_status:session.payment_status };
+}
+
+/* ---------- Labels / helpers ---------- */
+function fmtLocal_(iso, pattern){
+  if (!iso) return '';
+  const tz = CFG.TZ, d = new Date(iso);
+  return Utilities.formatDate(d, tz, pattern || 'EEE, MMM d h:mma');
+}
+function fmtWindow_(iso){
+  if (!iso) return '';
+  const s = new Date(iso), e = new Date(s.getTime() + (CFG.SLOT_MINUTES*60000)), tz = CFG.TZ;
+  return Utilities.formatDate(s, tz, 'h:mma') + '–' + Utilities.formatDate(e, tz, 'h:mma');
+}
+
+/* ---------- Parse addons from sheet JSON ---------- */
+function parseAddons_(addonsJson){
+  try{
+    const arr = JSON.parse(addonsJson || '[]');
+    return Array.isArray(arr) ? arr.map(x=>({ id:String(x.id||''), label:String(x.label || x.id || 'Add-on'), amount:Number(x.amount || 0) })) : [];
+  }catch(_){ return []; }
+}
+
+/* ---------- Build a compact public booking payload for the UI ---------- */
+function buildPublicBooking_(row, idx){
+  const booking_id = String(row[idx.booking_id]||'');
+  const status     = String(row[idx.status]||'');
+  const name       = String(row[idx.customer_name]||'');
+  const email      = String(row[idx.email]||'');
+  const phone      = String(row[idx.phone]||'');
+
+  const bags       = Number(row[idx.bags]||0);
+  const days       = Number(row[idx.days]||1);
+  const base_label = String(row[idx.base_label]||'');
+
+  const puIso      = String(row[idx.pickup_time_iso]||'');
+  const puAddr     = String(row[idx.pickup_addr]||'');
+  const doIso      = String(row[idx.dropoff_time_iso]||'');
+  const doAddr     = String(row[idx.dropoff_addr]||'');
+
+  const addons     = parseAddons_(String(row[idx.addons_json]||'[]'));
+  const priceCents = Number(row[idx.price_cents]||0);
+
+  return {
+    booking_id,
+    status,
+    customer: { name, email, phone },
+    bags, days, passName: base_label || passNameForBags_(bags),
+    addons: addons.map(a => ({ id:a.id, label:a.label, amount:a.amount })),
+    pickup:  { address: puAddr, window: fmtWindow_(puIso), datetime_iso: puIso, date_label: fmtLocal_(puIso,'EEE MMM d') },
+    dropoff: { address: doAddr, window: fmtWindow_(doIso), datetime_iso: doIso, date_label: fmtLocal_(doIso,'EEE MMM d') },
+    total_cents: priceCents
+  };
+}
+
+
+/* ---------- Build Stripe Checkout params ---------- */
+function buildStripeParams_(items, successUrl, cancelUrl, email, metadata){
+  const parts = [];
+  parts.push('mode=payment');
+  if (email) parts.push('customer_email='+encodeURIComponent(email));
+  parts.push('success_url='+encodeURIComponent(successUrl));
+  parts.push('cancel_url='+encodeURIComponent(cancelUrl));
+  Object.keys(metadata||{}).forEach(k=>{ const v=metadata[k]; if (v!==undefined && v!==null) parts.push('metadata['+encodeURIComponent(k)+']=' + encodeURIComponent(String(v))); });
+  items.forEach((it,i)=>{
+    parts.push(`line_items[${i}][price_data][currency]=usd`);
+    parts.push(`line_items[${i}][price_data][product_data][name]=`+encodeURIComponent(it.name.slice(0,120)));
+    parts.push(`line_items[${i}][price_data][unit_amount]=`+encodeURIComponent(String(it.amount_cents|0)));
+    parts.push(`line_items[${i}][quantity]=`+encodeURIComponent(String(it.qty||1)));
+  });
+  return parts.join('&');
+}
+
+/* ---------- Notifications (Mail & Twilio SMS) ---------- */
+function sendMail_(to, subject, html, cc){ try{ MailApp.sendEmail({ to, cc:cc||'', subject, htmlBody: html }); }catch(_){} }
+function sendSMS_(toE164, text){
+  try{
+    const SID=(SP.getProperty('TWILIO_SID')||'').trim(), TOKEN=(SP.getProperty('TWILIO_TOKEN')||'').trim(), FROM=(SP.getProperty('TWILIO_FROM')||'').trim();
+    if (!(SID && TOKEN && FROM && toE164)) return false;
+    const url = 'https://api.twilio.com/2010-04-01/Accounts/'+encodeURIComponent(SID)+'/Messages.json';
+    UrlFetchApp.fetch(url, { method:'post', payload:{ To:toE164, From:FROM, Body:text }, headers:{ Authorization:'Basic '+Utilities.base64Encode(SID+':'+TOKEN) }, muteHttpExceptions:true });
+    return true;
+  }catch(_){ return false; }
+}
+
+/* ---------- Notify ops + customer on PAID (idempotent + locked) ---------- */
+function notifyPaid_(row, idx){
+  const lock = LockService.getScriptLock();
+  try { lock.tryLock(5000); } catch(_){}
+
+  try{
+    const sh = openOrCreateSheet_(), idxMap = idx;
+    const bookingId = String(row[idxMap.booking_id]||'');
+    const data = sh.getDataRange().getValues();
+    let rFound = -1;
+    for (let r=1; r<data.length; r++){ if (String(data[r][idxMap.booking_id]||'') === bookingId){ rFound = r; break; } }
+    if (rFound < 0) return;
+
+    const emailSentCol = ensureHeaderIndex_(sh, 'email_cust_sent', idxMap);
+    const smsSentCol   = ensureHeaderIndex_(sh, 'sms_cust_sent',   idxMap);
+    const notifiedCol  = ensureHeaderIndex_(sh, 'notified_at_utc', idxMap);
+
+    const latest = sh.getRange(rFound+1, 1, 1, sh.getLastColumn()).getValues()[0];
+
+    const name   = String(latest[idxMap.customer_name]||'');
+    const email  = String(latest[idxMap.email]||'');
+    const phone  = String(latest[idxMap.phone]||'');
+    const bags   = Number(latest[idxMap.bags]||0);
+    const days   = Number(latest[idxMap.days]||1);
+    const puIso  = String(latest[idxMap.pickup_time_iso]||'');
+    const doIso  = String(latest[idxMap.dropoff_time_iso]||'');
+    const puAddr = String(latest[idxMap.pickup_addr]||'');
+    const doAddr = String(latest[idxMap.dropoff_addr]||'');
+    const addons = parseAddons_(String(latest[idxMap.addons_json]||'[]'));
+    const priceCents = Number(latest[idxMap.price_cents]||0);
+
+    const alreadyEmail = String(latest[emailSentCol]||'').trim();
+    const alreadySMS   = String(latest[smsSentCol]||'').trim();
+
+    const passName = passNameForBags_(bags);
+    const b = {
+      id: bookingId, customer:{ name, email },
+      bags, days, passName,
+      addOns: addons.map(a => `${a.label} ($${a.amount || 0})`),
+      pickup: { address: puAddr, window: fmtWindow_(puIso), date: fmtLocal_(puIso,'EEE MMM d') },
+      dropoff:{ address: doAddr, window: fmtWindow_(doIso), date: fmtLocal_(doIso,'EEE MMM d') },
+      curbsidePWM: addons.some(a => /Jetport|Airport|Curbside/i.test(a.label)),
+      total: `$${(priceCents/100).toFixed(2)}`
+    };
+    const html = buildConfirmHtml_(b);
+
+    try{
+      const ops = (SP.getProperty('OPS_EMAIL')||'').trim();
+      const subj = `PCL — PAID ${bookingId} — ${name}`;
+      if (ops) sendMail_(ops, subj, html);
+    }catch(_){}
+
+    try{
+      if (email && !alreadyEmail){
+        sendMail_(email, `Your booking is confirmed — ${bookingId}`, html);
+        sh.getRange(rFound+1, emailSentCol+1).setValue(new Date().toISOString());
+      }
+    }catch(_){}
+
+    try{
+      if (phone.startsWith('+') && !alreadySMS){
+        const okSms = sendSMS_(phone, formatCustomerPaidSMS_(latest, idxMap));
+        if (okSms) sh.getRange(rFound+1, smsSentCol+1).setValue(new Date().toISOString());
+      }
+    }catch(_){}
+
+    try{ sh.getRange(rFound+1, notifiedCol+1).setValue(new Date().toISOString()); }catch(_){}
+
+    try{
+      if (!alreadyEmail && !alreadySMS){
+        const opsPhone = (SP.getProperty('OPS_PHONE')||'').trim();
+        if (opsPhone){
+          const total = (Number(latest[idxMap.price_cents]||0)/100).toFixed(2);
+          sendSMS_(opsPhone, `💳 PAID ${bookingId} — ${name} — $${total}`);
+        }
+      }
+    }catch(_){}
+  } finally {
+    try{ lock.releaseLock(); }catch(_){}
+  }
+}
+
+/* -------- UI Menu -------- */
+function onOpen(){
+  try{
+    SpreadsheetApp.getUi()
+      .createMenu('PCL')
+      .addItem('Rebuild Capacity Dashboard','rebuildCapacityDashboard_')
+      .addSeparator()
+      .addItem('Resend Missing SMS (selected rows)','resendMissingSMSForSelection_')
+      .addToUi();
+  }catch(_){}
+}
+function rebuildCapacityDashboard_(){
+  const sh = openOrCreateSheet_(), idx = hdrIndex_(sh), data = sh.getDataRange().getValues();
+  const cap = CFG.CAPACITY_PER_SLOT || 3;
+  const pick = new Map(), drop = new Map();
+  for (let r=1;r<data.length;r++){
+    const status = String(data[r][idx.status]||'').toUpperCase();
+    if (status!=='PENDING' && status!=='PAID') continue;
+    const p = isoToLocalKey_(String(data[r][idx.pickup_time_iso]||'')); if (p) pick.set(p,(pick.get(p)||0)+1);
+    const d = isoToLocalKey_(String(data[r][idx.dropoff_time_iso]||'')); if (d) drop.set(d,(drop.get(d)||0)+1);
+  }
+  const keys = Array.from(new Set([...pick.keys(), ...drop.keys()])).sort();
+  const rows = [['slot_local','pickup_count','dropoff_count','capacity','pickup_available','dropoff_available']];
+  keys.forEach(k=>{ const pc=pick.get(k)||0, dc=drop.get(k)||0; rows.push([k, pc, dc, cap, (pc<cap), (dc<cap)]); });
+
+  const ss = sh.getParent();
+  let capSheet = ss.getSheetByName('Capacity'); if (!capSheet) capSheet = ss.insertSheet('Capacity');
+  capSheet.clear();
+  capSheet.getRange(1,1,rows.length,rows[0].length).setValues(rows);
+  capSheet.setFrozenRows(1);
+}
+
+/* ---------------- Email HTML (v3) ---------------- */
+function buildConfirmHtml_(b){
+  const supportPhone = (SP.getProperty('SUPPORT_PHONE') || '(207) 747-8336').trim();
+  const manageBase   = (SP.getProperty('MANAGE_URL_BASE') || 'https://www.portcityluggage.com/manage?b=').trim();
+  const manageUrl    = manageBase + encodeURIComponent(b.id);
+  const addOns       = (b.addOns && b.addOns.length) ? b.addOns.join(', ') : 'None';
+  const today        = Utilities.formatDate(new Date(), (SP.getProperty('TZ')||'America/New_York'), 'MMM d, yyyy');
+
+  return `<!DOCTYPE html>
+<html lang="en" style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+<head>
+<meta charset="utf-8"><meta name="x-apple-disable-message-reformatting">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">
+<title>Port City Luggage — Booking Confirmed</title>
+<style>
+  body{margin:0;background:#F3F5F8;color:#111315}
+  .wrap{max-width:700px;margin:0 auto}
+  .container{background:#FFFFFF;border-radius:18px;overflow:hidden;box-shadow:0 14px 28px rgba(17,24,39,.10)}
+  .px{padding-left:28px;padding-right:28px}
+  .py{padding-top:22px;padding-bottom:22px}
+  .muted{color:#5B6472}.rule{height:1px;background:#E6E8EC;margin:18px 0}
+  .btn{display:inline-block;background:#0b2e66;color:#fff!important;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:700}
+  .k{color:#0b2e66;font-weight:700}.strap{background:#F7F8FB;border-bottom:1px solid #E6E8EC}
+  .total{font-size:28px;font-weight:800;letter-spacing:.2px}.label{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#5B6472}
+  .card{background:#fff;border:1px solid #E6E8EC;border-radius:14px;padding:16px}
+  .row{display:flex;gap:22px;flex-wrap:wrap}.col{flex:1;min-width:280px}
+  .h1{font-size:22px;line-height:1.35;margin:0 0 6px}.h2{font-size:16px;line-height:1.35;margin:0 0 8px;text-transform:uppercase;letter-spacing:.08em;color:#5B6472}
+  .chips{display:flex;gap:8px;flex-wrap:wrap}.chip{border:1px solid #E6E8EC;border-radius:999px;padding:6px 10px;font-size:12px;color:#394150}
+  .gloss{height:8px;background:linear-gradient(180deg,rgba(255,255,255,.6),rgba(255,255,255,0))}
+  @media (prefers-color-scheme: dark){
+    body{background:#0b0e13;color:#F3F4F6}.container{background:#12161d;box-shadow:0 14px 28px rgba(0,0,0,.55)}
+    .strap{background:#12161d;border-bottom-color:#2A2F36}.muted{color:#A0A8B3}.rule{background:#2A2F36}
+    .card{background:#12161d;border-color:#2A2F36}.chip{border-color:#2A2F36;color:#C8CDD6}
+  }
+</style>
+</head>
+<body>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+    <tr><td style="padding:24px" align="center">
+      <div class="wrap"><div class="container">
+        <div class="strap px py">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+            <div>
+              <div class="label">Port City Luggage</div>
+              <div class="h1" style="margin:6px 0 0">Thanks, your booking is confirmed</div>
+              <div class="muted" style="font-size:13px;margin-top:4px">Booking ID: ${b.id}</div>
+            </div>
+            <div style="text-align:right">
+              <div class="label">Total</div>
+              <div class="total">${b.total}</div>
+              <div class="muted" style="font-size:12px;margin-top:4px">${today}</div>
+            </div>
+          </div>
+        </div>
+        <div class="gloss"></div>
+        <div class="px py" style="padding-top:16px">
+          <p style="margin:0 0 10px;font-size:16px">Hi ${b.customer.name},</p>
+          <p style="margin:0;font-size:16px">We’ve got the bags—enjoy your day in Portland. Your details and next steps are below.</p>
+        </div>
+        <div class="px">
+          <div class="card">
+            <div class="row">
+              <div class="col">
+                <div class="h2">Booking</div>
+                <div><span class="k">Name:</span> ${b.customer.name} — <a href="mailto:${b.customer.email}" style="color:#0b2e66;text-decoration:none">${b.customer.email}</a></div>
+                <div><span class="k">Bags / Days:</span> ${b.bags} / ${b.days}</div>
+                ${b.passName ? `<div><span class="k">Pass:</span> ${b.passName}</div>` : ``}
+                <div><span class="k">Add-ons:</span> ${addOns}</div>
+              </div>
+              <div class="col">
+                <div class="h2">Schedule</div>
+                <div><span class="k">Pickup:</span> ${b.pickup.address}</div>
+                <div><span class="k">Window:</span> ${b.pickup.window} (${b.pickup.date})</div>
+                <div class="rule"></div>
+                <div><span class="k">Drop-off:</span> ${b.dropoff.address}</div>
+                <div><span class="k">Window:</span> ${b.dropoff.window} (${b.dropoff.date})</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="px py">
+          <div class="h2">What happens next</div>
+          <ol style="margin:8px 0 0;padding-left:18px;font-size:16px">
+            <li style="margin-bottom:10px"><strong>Day-of text.</strong> We’ll message when your driver is en route for pickup—inside your window.</li>
+            <li style="margin-bottom:10px"><strong>Hand-off & verify.</strong> We confirm name and bag count; bags are stored securely until return.</li>
+            <li style="margin-bottom:10px"><strong>Easy changes.</strong> Update time or address up to <strong>90 minutes before your drop-off window</strong>.</li>
+            <li style="margin-bottom:0"><strong>On-time return.</strong> We meet you during your drop-off window.</li>
+          </ol>
+        </div>
+        <div class="px">
+          <div class="chips" style="margin-bottom:14px"><span class="chip">Local team</span><span class="chip">Text updates</span><span class="chip">Flexible changes</span></div>
+          <a class="btn" href="${manageUrl}">View / Manage Booking</a>
+        </div>
+        <div class="px py">
+          <div class="rule"></div>
+          <div class="muted" style="font-size:13px;line-height:1.6">
+            Questions? Reply to this email or text ${supportPhone} (8:00–20:00).<br>
+            © ${new Date().getFullYear()} Port City Luggage — Portland, ME
+          </div>
+        </div>
+      </div></div>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
+/* ------------------------------- smoketests -------------------------------- */
+function _webhook_smoke_test_last_booking(){
+  const sh=openOrCreateSheet_(); const ix=hdrIndex_(sh);
+  const r = sh.getLastRow(); if (r<2) throw new Error('No bookings in sheet');
+  const id = String(sh.getRange(r, ix.booking_id+1).getValue()||'').trim();
+  const url = (SP.getProperty('SLACK_AUTOMATIONS_URL')||'').trim();
+  const secret = (SP.getProperty('INBOUND_SECRET')||'').trim();
+  if (!(url && secret && id)) throw new Error('Missing URL/secret/booking_id');
+  const resp = UrlFetchApp.fetch(url,{ method:'post', contentType:'application/json', payload: JSON.stringify({type:'booking_created', booking_id:id, secret}), muteHttpExceptions:false });
+  Logger.log(resp.getResponseCode()+' '+resp.getContentText());
+}
+function _print_booking_props(){
+  Logger.log('BOOK.SHEET_ID=' + SP.getProperty('SHEET_ID'));
+  Logger.log('BOOK.INBOUND_SECRET=' + SP.getProperty('INBOUND_SECRET'));
+  Logger.log('BOOK.SLACK_AUTOMATIONS_URL=' + SP.getProperty('SLACK_AUTOMATIONS_URL'));
+}
