@@ -1,0 +1,3069 @@
+<!-- =======================================================================
+   PORT CITY LUGGAGE — BOOKING WIDGET (v6.0 GPT EFFICIENT)  •  2025-08-18 patch
+   Cleaned & organized CSS (duplicates removed, grouped, and commented)
+   ======================================================================= -->
+
+<div id="pcl-app">
+  <div id="pcl-toast"></div>
+</div>
+
+<style>
+/* ==========================================================================
+   0) DESIGN TOKENS & ROOT
+   ========================================================================== */
+:root{
+  --blue:#0b2e66;    /* brand primary */
+  --muted:#6b7280;   /* body secondary text */
+  --border:#e5e5e5;  /* default border color */
+  --bg:#fafafa;      /* light app background */ 
+  --err:#b00020;     /* error red */
+}
+
+/* ==========================================================================
+   1) APP SHELL & TYPOGRAPHY
+   ========================================================================== */
+#pcl-app{
+  max-width:860px;
+  margin:0 auto;
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,Inter,Arial,sans-serif;
+}
+.pcl-title{ font-size:32px; margin:0 0 12px; }
+.pcl-h3{ font-size:20px; margin:0 0 6px; }
+.pcl-sub{ font-size:13px; color:var(--muted); margin:0 0 8px; }
+.pcl-muted{ color:var(--muted); font-size:12px; }
+
+/* ==========================================================================
+   2) LAYOUT PRIMITIVES
+   ========================================================================== */
+.pcl-box{
+  padding:14px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:var(--bg);
+  margin:8px 0 16px;
+}
+.pcl-row{
+  display:grid; grid-template-columns:1fr 1fr; gap:16px;
+  align-items:end; margin:6px 0 12px;
+}
+@media (max-width:720px){ .pcl-row{ grid-template-columns:1fr; } }
+
+.pcl-row-tight{
+  display:grid; grid-template-columns:1fr 1fr; gap:12px;
+}
+@media (max-width:720px){ .pcl-row-tight{ grid-template-columns:1fr; } }
+
+.pcl-grid{
+  display:grid; grid-template-columns:1fr 1fr; gap:14px;
+}
+@media (max-width:720px){ .pcl-grid{ grid-template-columns:1fr; } }
+
+/* ==========================================================================
+   3) FORMS & CONTROLS
+   ========================================================================== */
+.pcl-inp{
+  box-sizing:border-box; width:100%;
+  padding:12px; margin:6px 0 12px;
+  border:1px solid var(--border); border-radius:12px;
+  background:#fff;
+}
+select.pcl-inp option[disabled][value=""]{ color:#667; } /* placeholder for selects */
+
+.pcl-stepper{ display:inline-flex; align-items:center; gap:8px; }
+.pcl-stepper .num{ min-width:3ch; text-align:center; font-variant-numeric:tabular-nums; font-weight:700; }
+.pcl-stepper button{
+  width:38px; height:38px; border-radius:10px; border:1px solid var(--border);
+  background:#fff; cursor:pointer;
+}
+
+.pcl-actions{ display:flex; gap:10px; flex-wrap:wrap; }
+.pcl-btn{
+  padding:12px 16px; border-radius:12px; cursor:pointer;
+  border:1px solid var(--blue); background:var(--blue); color:#fff;
+}
+.pcl-btn.secondary{ background:#fff; color:#111; border:1px solid var(--border); }
+.pcl-btn:disabled{ opacity:.55; cursor:not-allowed; }
+.pcl-btn.loading::after{ /* small spinner suffix */
+  content:""; display:inline-block; width:14px; height:14px; margin-left:8px;
+  border:2px solid rgba(255,255,255,.9); border-right-color:transparent; border-radius:50%;
+  animation:spin .7s linear infinite;
+}
+@keyframes spin{ to{ transform:rotate(360deg) } }
+
+/* Inline toast banner (error/success) */
+.pcl-toast{
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+  padding:12px 14px; margin:0 0 14px; border-radius:12px;
+  background:#ffe6ea; color:var(--err); border:1px solid var(--err);
+  box-shadow:0 2px 8px rgba(0,0,0,.08);
+  font-size:14px; line-height:1.35; animation:pcl-toast-in .18s ease-out;
+}
+.pcl-toast .close{ background:transparent; border:0; cursor:pointer; font-size:18px; line-height:1; color:inherit; }
+@keyframes pcl-toast-in{ from{opacity:0; transform:translateY(-4px)} to{opacity:1; transform:translateY(0)} }
+.pcl-toast[data-kind="success"]{ background:#e9fbe9; border-color:#16a34a; color:#14532d; }
+
+
+/* ==========================================================================
+   4) STEP BAR & CHIPS (Navigation)
+   - Consolidated into one definition (removed earlier duplicates)
+   ========================================================================== */
+.pcl-stepbar{
+  display:flex; flex-wrap:wrap;
+  gap:12px;                 /* extra breathing room */
+  margin:8px 0 26px;        /* more space below for hero */
+}
+.pcl-chip{
+  position:relative;
+  font-size:14px; font-weight:500; letter-spacing:.1px; color:#2b2f36;
+  padding:10px 18px; border:0; border-radius:999px; background:#fff;
+  box-shadow: inset 0 0 0 1px #e5e7eb, 0 1px 0 rgba(0,0,0,.04);
+  cursor:pointer; user-select:none;
+  transition:background .2s ease, color .2s ease, box-shadow .2s ease, transform .08s ease;
+  -webkit-tap-highlight-color:transparent;
+}
+.pcl-chip:hover{
+  background:#f8fafc;
+  box-shadow: inset 0 0 0 1px #e1e5ea, 0 2px 6px rgba(0,0,0,.05);
+}
+.pcl-chip:active{ transform:translateY(1px); }
+.pcl-chip.active{
+  color:#fff; background:var(--blue);
+  box-shadow: inset 0 0 0 1px var(--blue), 0 6px 16px rgba(11,46,102,.20);
+}
+.pcl-chip:focus-visible{
+  outline:none;
+  box-shadow:
+    inset 0 0 0 2px var(--blue),
+    0 0 0 4px rgba(59,130,246,.20),
+    0 2px 8px rgba(0,0,0,.06);
+}
+.pcl-chip.disabled{ opacity:.55; cursor:not-allowed; }
+
+@media (max-width:420px){
+  .pcl-chip{ font-size:15px; padding:9px 14px; }
+}
+
+/* ==========================================================================
+   5) ICON MICRO-UI (Bags/Days)
+   ========================================================================== */
+.bag-icons{ display:flex; gap:6px; flex-wrap:wrap; }
+.bag{
+  width:18px; height:24px; border-radius:5px; position:relative;
+  display:flex; align-items:center; justify-content:center;
+  border:1.5px solid var(--blue);
+}
+.bag::before{
+  content:""; position:absolute; top:-6px; left:4px; right:4px; height:5px;
+  border:1.5px solid var(--blue); border-bottom:none; border-radius:6px 6px 0 0;
+}
+.bag::after{ content:"⚓"; font-size:11px; line-height:1; color:var(--blue); transform:translateY(.5px); }
+
+.day-icons{ display:flex; gap:6px; flex-wrap:wrap; }
+.day{
+  width:16px; height:16px; border-radius:3px; position:relative; background:#fff; border:1px solid var(--blue);
+}
+.day::before{ content:""; position:absolute; top:-3px; left:2px; right:2px; height:4px; background:var(--blue); border-radius:2px; }
+.day::after{ content:""; position:absolute; top:4px; left:4px; right:4px; bottom:3px; border:1px solid var(--blue); border-radius:2px; opacity:.2; }
+
+/* ==========================================================================
+   6) SUGGEST UI (both popover and list variants)
+   ========================================================================== */
+.pcl-suggest{ position:relative; display:flex; justify-content:flex-end; }
+.pcl-suggest.open{ margin-bottom:10px; }   /* add spacing when open */
+.pcl-suggest-toggle{
+  background:transparent; border:0; cursor:pointer;
+  color:#6b7280; font-weight:600; padding:6px 0;
+}
+.pcl-suggest-toggle:hover{ color:#111; }
+.pcl-suggest-pop{
+  display:none; position:absolute; right:0; top:100%; margin-top:8px;
+  background:#fff; border:1px solid var(--border); border-radius:12px;
+  box-shadow:0 10px 25px rgba(0,0,0,.10); padding:8px; z-index:50;
+  max-width:min(92vw,580px);
+}
+.pcl-suggest.open .pcl-suggest-pop{ display:flex; flex-wrap:wrap; gap:8px; }
+
+/* Legacy dropdown-list variant (kept for compatibility) */
+.pcl-suggest-list{
+  position:absolute; left:0; right:0; z-index:9999;
+  background:#fff; border:1px solid var(--border); border-radius:10px; overflow:hidden;
+  box-shadow:0 6px 18px rgba(0,0,0,.08);
+}
+.pcl-suggest-item{ padding:10px 12px; cursor:pointer; }
+.pcl-suggest-item:hover{ background:#f7f7f7; }
+
+/* Small chip buttons inside suggestions */
+.pcl-chipbtn,
+.pcl-chipbtn.sm{
+  border-radius:999px; border:1px solid #e6e9ee; cursor:pointer; font-weight:600;
+}
+.pcl-chipbtn{ padding:8px 12px; background:#f7f9fb; color:#2b2f36; }
+.pcl-chipbtn:hover{ background:#eef2f7; }
+.pcl-chipbtn.sm{
+  padding:6px 10px; font-size:12px; line-height:1; background:#f7f7f7; color:#374151; border:1px solid var(--border);
+}
+.pcl-chipbtn.sm:hover{ background:#fff; }
+.pcl-chips{ display:flex; flex-wrap:wrap; gap:8px; }
+
+/* ==========================================================================
+   7) PASS HERO (Step 1)
+   - Includes elevation & palette variants
+   ========================================================================== */
+.pcl-passhero{
+  --accent:#0b2e66; --badge:#0b2e66; --bg1:#f7fbff; --bg2:#ffffff;
+  background:linear-gradient(140deg,var(--bg1),var(--bg2));
+  border:1px solid rgba(0,0,0,.06);
+  border-radius:14px;
+  padding:16px 16px 14px;
+  margin:0 0 22px;                    /* sits on its own stage */
+  position:relative; overflow:hidden;
+  box-shadow:
+    0 20px 42px rgba(11,46,102,.10),   /* deep, soft drop */
+    0 8px 18px rgba(11,46,102,.06),    /* mid drop */
+    inset 0 1px 0 rgba(255,255,255,.65); /* gentle top highlight */
+}
+.pcl-passhero::before{ /* subtle top gleam */
+  content:""; position:absolute; inset:-1px -1px auto -1px; height:40%;
+  border-radius:14px;
+  background:linear-gradient(180deg, rgba(255,255,255,.65), rgba(255,255,255,0));
+  pointer-events:none; mix-blend-mode:soft-light; opacity:.7;
+}
+.pcl-passhero::after{  /* soft ground halo */
+  content:""; position:absolute; left:8%; right:8%; bottom:-16px; height:28px;
+  border-radius:50%;
+  background:radial-gradient(ellipse at center, rgba(11,46,102,.18), transparent 70%);
+  filter:blur(10px); opacity:.25; pointer-events:none;
+}
+
+/* Header grid */
+.pcl-passhero .head{
+  display:grid; grid-template-columns:1fr auto;
+  column-gap:18px; row-gap:8px; align-items:center; margin-bottom:8px;
+}
+
+/* Title column */
+.pcl-passhero .titlecol{ display:flex; flex-direction:column; gap:6px; position:relative; align-items:flex-start; }
+.pcl-passhero .title{
+  font-size:22px; font-weight:900; margin:0; color:var(--accent);
+  letter-spacing:.2px; line-height:1.15;
+  text-shadow:0 1px 0 rgba(255,255,255,.9), 0 14px 24px rgba(11,46,102,.10);
+  position:relative;
+}
+@media (min-width:720px){ .pcl-passhero .title{ font-size:24px; } }
+
+/* Title shine (one-shot) */
+.pcl-passhero.shine .title::after{
+  content:""; position:absolute; top:-20%; bottom:-20%; left:-140%; width:120%; pointer-events:none;
+  background:linear-gradient(110deg, rgba(255,255,255,0) 0%, rgba(255,255,255,.5) 45%, rgba(255,255,255,0) 90%);
+  transform:skewX(-12deg); animation:shineTitle 900ms ease-out 1;
+}
+@keyframes shineTitle{ to{ left:120%; } }
+
+/* Small "fits" pill under title */
+.pcl-passhero .pill{
+  align-self:flex-start; display:inline-flex; align-items:center; justify-content:center;
+  font-size:11px; line-height:1.05; padding:3px 8px; width:auto; flex:0 0 auto;
+  max-width:180px; white-space:nowrap; border-radius:999px;
+  border:1px solid rgba(0,0,0,.12); color:var(--accent); background:#fff;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.65);
+}
+@media (max-width:420px){ .pcl-passhero .pill{ font-size:10.5px; padding:2px 8px; } }
+
+/* Price badge */
+.pcl-passhero .price-badge{
+  position:relative; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  background:var(--badge); color:#fff; border-radius:12px;
+  padding:10px 16px; min-width:118px; text-align:center; line-height:1; font-weight:900;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.35), 0 6px 12px rgba(0,0,0,.10);
+}
+.pcl-passhero .price-badge .amt{ font-size:30px; }
+.pcl-passhero .price-badge .badge-sub{ font-size:11px; opacity:.9; margin-top:4px; font-weight:700; }
+
+/* Copy & divider */
+.pcl-passhero .sub{ font-size:13px; color:var(--muted); }
+.pcl-passhero .divider{
+  height:1px; background:linear-gradient(90deg,transparent,rgba(0,0,0,.08),transparent); margin:10px 0;
+}
+
+/* Controls */
+.pcl-passhero .ctr-grid{ display:grid; grid-template-columns:1fr; gap:8px; }
+.pcl-passhero .ctr-block{ display:grid; grid-template-rows:auto auto auto; gap:10px; text-align:left; }
+.pcl-passhero .ctr-label{
+  font-weight:800; font-size:18px; letter-spacing:.1px;
+  text-align:center; width:100%;
+}
+@media (min-width:720px){ .pcl-passhero .ctr-label{ font-size:20px; } }
+
+/* Stepper prominence inside hero */
+.pcl-passhero .stepwrap{ display:flex; justify-content:center; align-items:center; gap:12px; }
+.pcl-passhero .pcl-stepper{ display:inline-flex; align-items:center; gap:10px; }
+.pcl-passhero .pcl-stepper .num{ min-width:3ch; text-align:center; font-variant-numeric:tabular-nums; font-weight:900; font-size:22px; }
+.pcl-passhero .pcl-stepper button{
+  width:44px; height:44px; border-radius:12px; border:1px solid rgba(0,0,0,.10);
+  background:#fff; cursor:pointer; box-shadow:0 1px 0 rgba(0,0,0,.04);
+
+   /* Prevent iOS double‑tap zoom when tapping quickly */
+  touch-action: manipulation;
+
+  /* Make sure focus/tap doesn’t trigger text-zoom heuristics */
+  font-size:16px;                 /* (>=16px avoids iOS auto-zoom) */
+  -webkit-user-select:none; user-select:none;
+  -webkit-tap-highlight-color:transparent;
+}
+.pcl-passhero .pcl-stepper button:active{ transform:translateY(1px); }
+
+/* Refined bag icons (hero) */
+.pcl-passhero .bagwrap{ display:flex; justify-content:center; align-items:center; gap:10px; }
+.pcl-passhero .bagrow{ display:flex; align-items:center; gap:10px; }
+.pcl-passhero .bagrow.pop{ animation:pop 200ms cubic-bezier(.22,.9,.22,1); }
+@keyframes pop{ 0%{transform:scale(.98)} 60%{transform:scale(1.06)} 100%{transform:scale(1)} }
+.pcl-passhero .bigbag{
+  width:22px; height:26px; position:relative; border-radius:6px;
+  background:linear-gradient(180deg,#fff,#f0f4f9);
+  border:1.8px solid var(--accent);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.9), inset 0 -2px 6px rgba(11,46,102,.08), 0 1px 0 rgba(0,0,0,.04);
+}
+.pcl-passhero .bigbag:before{
+  content:""; position:absolute; top:-7px; left:5px; right:5px; height:7px;
+  border:1.8px solid var(--accent); border-bottom:none; border-radius:8px 8px 0 0;
+  background:linear-gradient(180deg,rgba(255,255,255,.8),rgba(255,255,255,0));
+}
+.pcl-passhero .bigbag:after{
+  content:""; position:absolute; left:6px; right:6px; bottom:-3px; height:3px;
+  border-radius:3px; background:rgba(11,46,102,.25); filter:blur(1px);
+}
+
+/* Micro animation & hover */
+.pcl-passhero.animate{ animation:pass-bump 180ms cubic-bezier(.2,.8,.2,1); }
+@keyframes pass-bump{ 0%{transform:scale(1)} 50%{transform:scale(1.015)} 100%{transform:scale(1)} }
+.pcl-passhero.shine .price-badge::after{
+  content:""; position:absolute; left:-120%; top:0; width:120%; height:100%;
+  background:linear-gradient(110deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.35) 45%,rgba(255,255,255,0) 90%);
+  transform:skewX(-12deg); animation:shine 900ms ease-out 1;
+}
+@media (hover:hover){ .pcl-passhero:hover{ transform:translateY(-1px); transition:transform .12s ease; } }
+@keyframes shine{ to{ left:120%; } }
+
+/* Palette variants */
+.pcl-passhero.pass-solo   { --accent:#6f5632; --badge:#8c6a3c; --bg1:#faf5ef; --bg2:#ffffff; }
+.pcl-passhero.pass-couples{ --accent:#5a636d; --badge:#7c8794; --bg1:#f6f8fa; --bg2:#ffffff; }
+.pcl-passhero.pass-family { --accent:#735b17; --badge:#a8872a; --bg1:#fbf7ea; --bg2:#ffffff; }
+.pcl-passhero.pass-large  { --accent:#485c6f; --badge:#617a92; --bg1:#f5f7fa; --bg2:#ffffff; }
+
+/* ==========================================================================
+   8) TRUST ROW + CONTACT CARD
+   ========================================================================== */
+.pcl-trust{
+  display:flex; flex-wrap:wrap; justify-content:center; align-items:center;
+  gap:12px 14px; margin:16px 0 18px; font-size:13.5px; color:#6b7280; /* extra air around pass/contact */
+}
+.pcl-trust .t-item{ display:inline-flex; align-items:center; gap:6px; }
+.pcl-trust .t-dot{ opacity:.45; }
+
+.pcl-contact{
+  background:#f6f7f9;
+  border:1px solid #e6e9ee;
+  border-radius:12px;
+  padding:12px;
+  box-shadow:0 1px 0 rgba(0,0,0,.02);
+  margin:4px 0 8px;
+}
+.pcl-contact .pcl-inp{
+  height:46px; border-radius:12px; border:1px solid #e5e7eb;
+  box-shadow:inset 0 1px 0 rgba(0,0,0,.02);
+}
+.pcl-contact .pcl-inp:focus{
+  outline:none; border-color:#93c5fd; box-shadow:0 0 0 3px rgba(59,130,246,.18);
+}
+.pcl-contact .help{ font-size:12px; color:#6b7280; margin-top:6px; }
+
+/* ==========================================================================
+   9) INLINE QUESTIONS (Schedule page)
+   ========================================================================== */
+.pcl-inlineq{
+  background:#fff; border:1px solid rgba(0,0,0,.06); border-radius:14px;
+  padding:14px; margin:10px 0 12px;
+  box-shadow:0 10px 26px rgba(11,46,102,.08), 0 6px 14px rgba(11,46,102,.05), inset 0 1px 0 rgba(255,255,255,.6);
+  transition: box-shadow .18s ease, transform .08s ease, border-color .18s ease, background .18s ease;
+}
+.pcl-inlineq h4{ margin:0 0 6px; font-size:18px; font-weight:800; letter-spacing:.1px; }
+.pcl-inlineq .sub{ color:#6b7280; font-size:13px; margin-bottom:8px; }
+.pcl-inlineq .rowhead{ display:flex; justify-content:space-between; align-items:center; gap:12px; }
+
+.pcl-choices{ display:flex; gap:10px; flex-wrap:wrap; }
+.pcl-choice{
+  padding:10px 14px; border-radius:12px; font-weight:700; cursor:pointer; color:#111;
+  border:1px solid #e6e9ee; background:#fff; box-shadow:0 1px 0 rgba(0,0,0,.04);
+  transition:transform .08s ease, box-shadow .2s ease, background .2s ease;
+}
+.pcl-choice.primary{
+  background:var(--blue); color:#fff; border-color:var(--blue);
+  box-shadow:0 8px 16px rgba(11,46,102,.20), inset 0 1px 0 rgba(255,255,255,.25);
+}
+.pcl-choice:active{ transform:translateY(1px); }
+
+.pcl-seg{
+  display:flex; gap:10px; flex-wrap:wrap;
+  background:#f6f7f9; border:1px solid #e6e9ee; border-radius:14px; padding:10px; margin-top:10px;
+}
+.pcl-seg .opt{
+  flex:1; min-width:180px; display:flex; align-items:center; justify-content:space-between; gap:10px;
+  padding:10px 12px; border-radius:12px; background:#fff; border:1px solid #e6e9ee; cursor:pointer;
+  font-weight:700; color:#2b2f36; box-shadow:0 1px 0 rgba(0,0,0,.04);
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+.pcl-seg .opt .amt{
+  background:#0b2e66; color:#fff; border-radius:999px; padding:6px 10px; font-weight:800; font-size:12px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.25);
+}
+.pcl-seg .opt.active{ background:#0b2e66; color:#fff; border-color:#0b2e66; }
+.pcl-seg .opt.active .amt{ background:#17407f; }
+
+.pcl-badge{
+  background:var(--blue); color:#fff; font-weight:900; line-height:1;
+  padding:8px 10px; border-radius:10px; box-shadow:inset 0 1px 0 rgba(255,255,255,.25);
+  min-width:58px; text-align:center;
+}
+
+/* Focus elevation helper for active card/inlineq */
+.pcl-card, .pcl-inlineq{ transition: box-shadow .18s ease, transform .08s ease, border-color .18s ease, background .18s ease; }
+.pcl-focus{
+  position:relative; background:#fff;
+  border-color:rgba(11,46,102,.22) !important;
+  box-shadow: 0 18px 36px rgba(11,46,102,.12), 0 8px 18px rgba(11,46,102,.06), inset 0 1px 0 rgba(255,255,255,.6);
+}
+@media (hover:hover){ .pcl-focus:hover{ transform:translateY(-1px); } }
+.pcl-focus::before{ /* soft top gleam */
+  content:""; position:absolute; left:0; right:0; top:0; height:40%;
+  border-radius:inherit; background:linear-gradient(180deg, rgba(255,255,255,.55), rgba(255,255,255,0));
+  pointer-events:none; opacity:.6;
+}
+
+/* ==========================================================================
+   10) STEP 4 — SCHEDULE / REVIEW CARDS
+   - Duplicates removed & unified styles
+   ========================================================================== */
+.pcl-card{
+  background:#fff; border:1px solid rgba(0,0,0,.06); border-radius:16px;
+  padding:16px; margin:10px 0 24px;
+  box-shadow:0 20px 42px rgba(11,46,102,.10), 0 8px 18px rgba(11,46,102,.06), inset 0 1px 0 rgba(255,255,255,.65);
+}
+.pcl-card h3{ margin:0 0 10px; font-size:22px; font-weight:800; letter-spacing:.1px; }
+.pcl-card h3{ margin-bottom:8px; } /* keep slightly tighter bottom space in cards */
+
+/* Edit links (pill buttons) */
+.pcl-editlinks{ display:flex; gap:8px; flex-wrap:wrap; }
+.pcl-editlinks .linkbtn{
+  font-weight:700; font-size:12px; padding:6px 10px; border-radius:999px;
+  border:1px solid #e6e9ee; background:#fff; cursor:pointer;
+}
+.pcl-editlinks .linkbtn:hover{ background:#f7f9fb; }
+
+.pcl-editpill-row{ display:flex; flex-wrap:wrap; gap:18px; margin:0 0 12px; }
+.pcl-editpill{
+  padding:12px 18px; border-radius:999px; background:#fff; border:1px solid #e6e9ee;
+  box-shadow:0 1px 0 rgba(0,0,0,.04); font-weight:700; cursor:pointer;
+}
+.pcl-editpill:hover{ background:#f8fafc; }
+
+/* Summary header + info banner */
+.pcl-review-top-title{
+  font-size:42px; font-weight:900; letter-spacing:.3px; margin:0 0 10px; color:#222;
+}
+.pcl-info-banner{
+  background:#eef6ff; border:1px solid #cfe2ff; border-radius:14px;
+  padding:14px 16px; color:#1f2937; margin:0 0 14px;
+}
+
+/* Review grid layout (final unified) */
+.pcl-review-grid{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) 360px;   /* left stack + right total */
+  gap:16px; align-items:start;
+}
+.pcl-review-grid .left-col{ grid-column:1; }
+.pcl-review-grid .right-col{ grid-column:2; align-self:start; }
+.pcl-review-grid .left-col > .pcl-card{ margin:8px 0 12px; }
+.pcl-review-grid .left-col > .pcl-card:first-child{ margin-top:0; }
+@media (max-width:720px){
+  .pcl-review-grid{ grid-template-columns:1fr; }
+  .pcl-review-grid .right-col{ grid-column:1; } /* total drops under left stack */
+}
+
+/* Address/time pair row */
+.pcl-row-addr{ display:grid; grid-template-columns:2fr 1fr; gap:12px; }
+@media (max-width:720px){ .pcl-row-addr{ grid-template-columns:1fr; } }
+
+/* Read-only "infield" boxes */
+.pcl-infield{ background:#fff; border:1px solid #e6e9ee; border-radius:12px; padding:12px; }
+.pcl-infield .lab{
+  font-size:12px; letter-spacing:.08em; font-weight:800; color:#0b2e66;
+  text-transform:uppercase; margin-bottom:6px;
+}
+
+/* Key/Value tiles & grids (deduped) */
+.pcl-kvgrid{ display:grid; grid-template-columns:1fr; gap:12px; margin-top:8px; }
+@media (min-width:720px){ .pcl-kvgrid{ grid-template-columns:1fr 1fr; } }
+
+.pcl-kv{
+  background:#fff; border:1px solid #e6e9ee; border-radius:12px;
+  padding:12px; box-shadow:0 1px 0 rgba(0,0,0,.03); margin:6px 0;
+}
+.pcl-kv .k{
+  font-size:12px; letter-spacing:.08em; text-transform:uppercase;
+  color:#6b7280; font-weight:800; margin-bottom:4px;
+}
+.pcl-kv .v{ font-size:16px; line-height:1.45; color:#111827; margin-top:3px; }
+
+/* Stacked lines variant */
+.pcl-kline{ margin:4px 0 8px; }
+.pcl-kline .k{
+  font-size:12px; text-transform:uppercase; letter-spacing:.08em;
+  color:#6b7280; font-weight:800; margin-bottom:2px;
+}
+.pcl-kline .v{ font-size:16px; line-height:1.45; color:#111827; }
+
+/* Small chips (summary badges) */
+.pcl-mini-chips{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.pcl-mini-chip{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:6px 10px; border-radius:999px;
+  background:#f1f5f9; border:1px solid #e5e7eb;
+  font-weight:700; font-size:12px; color:#0b2e66;
+}
+
+/* Sections within left card */
+.pcl-sechead{
+  font-size:12px; letter-spacing:.08em; text-transform:uppercase;
+  color:#0b2e66; font-weight:900; margin:10px 0 6px;
+}
+.pcl-slab{
+  background:#fff; border:1px solid #e6e9ee; border-radius:12px;
+  padding:12px; box-shadow:0 1px 0 rgba(0,0,0,.03); margin-top:8px;
+}
+
+/* Extra helper note */
+.pcl-note{
+  margin:16px 0; padding:14px 18px;
+  font-size:15px; line-height:1.5; color:#374151;
+  background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px;
+}
+
+/* Terms & actions spacing */
+.pcl-terms{
+  display:flex; align-items:center; gap:10px;
+  font-size:15px; color:#4b5563; margin:14px 2px 6px;
+}
+.pcl-terms input[type="checkbox"]{ width:20px; height:20px; }
+.pcl-actions{ margin-top:6px; }
+
+/* ==========================================================================
+   11) RECEIPT & TOTALS
+   ========================================================================== */
+.pcl-receipt{
+  border:1px dashed var(--border); border-radius:12px; padding:12px; background:#fff;
+}
+.pcl-receipt .row{
+  display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+  margin:6px 0;
+}
+.pcl-receipt .row > :first-child{ flex:1 1 auto; min-width:0; }
+.pcl-receipt .row > :last-child{ flex:0 0 auto; white-space:nowrap; text-align:right; }
+.pcl-receipt .total{ border-top:1px solid var(--border); padding-top:8px; font-weight:800; }
+
+.pcl-receipt-item{ display:flex; justify-content:space-between; margin:8px 0; }
+.pcl-receipt-label{ font-weight:500; }
+.pcl-receipt-sublines{
+  margin-left:12px; font-size:14px; color:#6b7280; line-height:1.4; /* indented muted sublines */
+}
+
+.pcl-totalbar{ margin-top:8px; margin-bottom:10px; }
+.pcl-total-sub{ color:#6b7280; font-size:12px; margin-top:4px; }
+
+/* Priority line (checkbox) */
+.pcl-priority{
+  display:flex; align-items:center; gap:10px;
+  margin:10px 0 4px; padding:10px 12px;
+  border:1px dashed var(--blue); border-radius:12px; background:#f7fbff;
+}
+.pcl-priority input{ width:18px; height:18px; }
+
+/* ==========================================================================
+   12) EXTRAS / MISC UI
+   ========================================================================== */
+.extras-grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+@media (max-width:720px){ .extras-grid{ grid-template-columns:1fr; } }
+
+.extra-card{
+  background:#fff; border:1px solid var(--border); border-radius:12px;
+  padding:12px; display:flex; justify-content:space-between; align-items:center;
+}
+.extra-card h4{ margin:0 0 4px; font-size:15px; }
+.extra-card p{ margin:0; color:var(--muted); font-size:12px; }
+
+.pcl-section-title{
+  font-weight:900; letter-spacing:.4px; color:var(--blue);
+  text-transform:uppercase; font-size:18px; margin:0 0 8px;
+}
+
+/* Credit card / phone inputs layout helpers */
+.cc-wrap{ display:flex; gap:10px; }
+.cc-select{ width:110px; }
+.phone-input{ flex:1; }
+
+/* ==========================================================================
+   13) ERRORS & HELPERS
+   ========================================================================== */
+.pcl-help{ font-size:12px; color:var(--muted); margin-top:-6px; margin-bottom:8px; }
+
+/* Unified error style (centered); .hidden utility hides it. */
+.pcl-err{ color:var(--err); text-align:center; margin:10px 0 0; }
+.pcl-err.hidden{ display:none; }
+
+#pcl-toast {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #fff;
+  border: 1px solid var(--err);
+  color: var(--err);
+  padding: 12px 16px;
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+  z-index: 9999;
+  display: none;
+  font-size: 15px;
+  max-width: 90%;
+}
+
+
+/* ==========================================================================
+   14) RESPONSIVE TWEAKS (global)
+   ========================================================================== */
+@media (max-width:720px){
+  .pcl-stepbar{ margin:6px 0 20px; }
+  .pcl-passhero{ margin-bottom:18px; }
+  .pcl-trust{ margin-top:12px; margin-bottom:14px; }
+}
+</style>
+
+
+
+
+
+
+
+
+
+
+<script>
+(function(){
+  /* ====================== CORE CONFIG ====================== */
+  const PROXY_URL = "https://pcl-proxy-githubdeploy.netlify.app/api/proxy";
+  const LOC_TOKEN  = "pk.b6b64f102fc16b6d7d01d45636c24681"; // retained (may be used elsewhere)
+  const SERVICE_ZIPS = ["04101","04102"];
+
+  const SLOT_MIN   = 15;
+  const OPEN_HOUR  = 8;
+  const CLOSE_HOUR = 20;
+
+  /* Debug + remote availability toggle */
+  const DEBUG = false;
+  const REMOTE_AVAIL = true;
+
+  /* ====================== PWM SETTINGS ====================== */
+  const PWM = { address: "1001 Westbrook St, Portland, ME 04102", zip: "04102", synonyms: [
+    "pwm","portland airport","portland maine airport","portland jetport",
+    "portland international jetport","jetport","airport pwm","portland international jetport (pwm)"
+  ], datalist: [] };
+
+  const PWM_DISPLAY_LABEL = "Portland International Jetport (PWM)";
+
+  /* ====================== SUGGESTED PICKUP SPOTS (Step 4) ====================== */
+  const SUGGESTED_PICKS = [
+    { id:'concord_amtrak', label:'Concord Coach / Amtrak (Thompson’s Point)', addr:"100 Thompson's Point Rd, Portland, ME", zip:'04102' },
+    { id:'casco_bay',      label:'Casco Bay Lines Ferry Terminal',            addr:'56 Commercial St, Portland, ME',        zip:'04101' },
+    { id:'pwm',            label:'Portland Int’l Jetport (PWM)',              addr: PWM.address,                             zip: PWM.zip },
+    { id:'lobster_co',     label:'Portland Lobster Company',                  addr:'180 Commercial St, Portland, ME',        zip:'04101' },
+    { id:'tandem_and',     label:'Tandem Coffee (Anderson St)',               addr:'122 Anderson St, Portland, ME',          zip:'04101' },
+    { id:'coffee_me_up',   label:'Coffee ME Up',                              addr:'221 Cumberland Ave, Portland, ME',       zip:'04101' }
+  ];
+
+  /* ====================== MAPBOX AUTOCOMPLETE ====================== */
+  const MAPBOX_TOKEN = 'pk.eyJ1IjoicG9ydGNpdHlsdWdnYWdlIiwiYSI6ImNtZWM5d3NnNjFjajMya29mdzczajhmd3cifQ.eQ9BDd2F1-9wHOn_syMSkg';
+const MAPBOX_PROX  = [-70.255, 43.659]; // Portland, ME (lng, lat)
+
+// PWM Departures curb (exact)
+const PWM_DEPARTURES = { lng: -70.312467, lat: 43.648547 };
+
+async function geocodeFirst(query){
+  try{
+    const q = String(query || '').trim();
+    if (!q) return null;
+    // tiny LRU-style cache on function (keeps ~64 last lookups)
+    const cache = (geocodeFirst._cache ||= new Map());
+    if (cache.has(q)) return cache.get(q);
+
+    const url = new URL(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json`);
+    url.searchParams.set('access_token', MAPBOX_TOKEN);
+    url.searchParams.set('limit','1');
+    url.searchParams.set('country','US');
+    url.searchParams.set('proximity', MAPBOX_PROX.join(','));
+    const r = await fetch(url.toString(), { cache:'no-store' });
+    const j = await r.json();
+    const f = (j && j.features && j.features[0]) || null;
+    const out = (f && Array.isArray(f.center)) ? { lng: +f.center[0], lat: +f.center[1] } : null;
+
+    cache.set(q, out);
+    if (cache.size > 64){ cache.delete(cache.keys().next().value); }
+    return out;
+  }catch(_){ return null; }
+}
+
+
+function staticMapURL(lng, lat, width=500, height=220, zoom=14){
+  const style = 'mapbox/streets-v12';
+  const pin   = `pin-s+0b2e66(${lng},${lat})`;
+  return `https://api.mapbox.com/styles/v1/${style}/static/${pin}/${lng},${lat},${zoom}/${width}x${height}@2x?access_token=${MAPBOX_TOKEN}`;
+}
+
+  /* ====================== PRICING & EXTRAS ====================== */
+  const SHOP = {
+    essentials: [
+      { id:'charger', label:'Portable phone charger (USB/USBC, pre-charged)', amount:49,
+        desc:'Pre-charged for all-day power.',
+        note:'Anker — 10,000 mAh (USB-A & USB-C)' },
+      { id:'socks',   label:'Fresh socks', amount:9,
+        desc:'Clean pair for the trip.',
+        note:'Pair of Thieves — White Crew Cut' },
+      { id:'earbuds', label:'Wired earbuds', amount:19,
+        desc:'Simple, reliable audio.',
+        note:'Apple 3.5mm, Lightning, or USB-C' },
+      { id:'tooth',   label:'Travel toothbrush kit', amount:9,  desc:'Sealed Brush + paste mini set.' },
+      { id:'carry40', label:'Collapsible nylon carry-on (40L)', amount:49, desc:'Packs flat. Opens to 40L.' },
+      { id:'beanbag', label:'Custom LL Bean PCL Boat & Tote', amount:59, desc:'Classic LL Bean medium tote, PCL edition.' }
+    ],
+    convenience: [
+      { id:'locks', label:'TSA travel lock',   amount:12, desc:'Keep zippers secure from A to B.' },
+      { id:'tags',  label:'Luggage tag (2-pack)', amount:9, desc:'Write-on contact info.' },
+      { id:'neck',  label:'Neck pillow (the one we love)', amount:29, desc:'Sit back and nod off on your way home.' }
+    ]
+  };
+
+  const ADDONS = {
+    pwm_curb:  { id:'pwm_curb',     label:'Portland Jetport Curbside Delivery', amount:29 },
+    ride_1_2:  { id:'ride_pwm_1_2', label:'Ride to PWM (1–2 people)',           amount:49 },
+    ride_3_4:  { id:'ride_pwm_3_4', label:'Ride to PWM (3–4 people)',           amount:79 },
+    priority:  { id:'priority',     label:'Priority Baggage Pickup',            amount:12 }
+  };
+
+  /* ====================== STATE ====================== */
+  const state = {
+    step: 1,
+    maxStep: 1,
+
+    name: "", email: "",
+    cc: "+1", phoneLocal: "",
+    bags: 2, days: 1,
+    extras: [],
+
+    curbside: null,
+    ride: null, ridePeople: null,
+    prefillDropPWM: false,
+    priority: false,
+
+    pickupAddress: "", pickupZip: "",  pickupCanon: "",
+    dropoffAddress: "", dropoffZip: "", dropoffCanon: "",
+
+    pickupDate: todayISO(), dropoffDate: todayISO(),
+    pickupSlot: "", dropoffSlot: "",
+
+    flightAirline: "", flightNumber: "",
+    noteToDriver: "",
+
+    terms: false,
+    booking_id: "",
+    price: 0, basePrice: 0
+  };
+
+  /* ===== Persist state ===== */
+  const TTL_MS = 30 * 60 * 1000;  // keep checkout state for 30 minutes
+  const PCL_SCHEMA_VERSION = 3; // bump when you change state shape
+  const PCL_STORE_KEY = 'pcl_booking_state_v1';
+  const PCL_META_KEY  = 'pcl_booking_meta_v1';
+
+  function persistState(){
+  // debounce + prefer idle time; identical stored shape.
+  const run = () => {
+    try{
+      const snapshot = JSON.parse(JSON.stringify(state));
+      sessionStorage.setItem(PCL_STORE_KEY, JSON.stringify(snapshot));
+      sessionStorage.setItem(PCL_META_KEY, JSON.stringify({
+        schema: PCL_SCHEMA_VERSION,
+        step: state.step || 1,
+        maxStep: state.maxStep || 1,
+        savedAt: Date.now()
+      }));
+    } catch(_) {}
+    persistState._tid = null;
+  };
+
+  if (persistState._tid){
+    // cancel pending
+    if (window.cancelIdleCallback) cancelIdleCallback(persistState._tid);
+    else clearTimeout(persistState._tid);
+  }
+  persistState._tid = window.requestIdleCallback
+    ? requestIdleCallback(run, { timeout: 500 })
+    : setTimeout(run, 0);
+}
+
+  function restoreState() {
+    try {
+      const metaRaw = sessionStorage.getItem(PCL_META_KEY);
+      const dataRaw = sessionStorage.getItem(PCL_STORE_KEY);
+      if (!metaRaw || !dataRaw) return 0;
+
+      const meta = JSON.parse(metaRaw);
+      if ((meta.schema|0) !== PCL_SCHEMA_VERSION) { clearStoredState(); return 0; }
+
+      const age  = Date.now() - (meta.savedAt || 0);
+      if (!Number.isFinite(age) || age > TTL_MS) { clearStoredState(); return 0; }
+
+            Object.assign(state, JSON.parse(dataRaw));
+      if (Number.isFinite(meta.step))    state.step = meta.step;
+      if (Number.isFinite(meta.maxStep)) state.maxStep = meta.maxStep;
+
+      // revive booking id if snapshot lost it (prevents duplicate bookings / slot_full)
+      try{
+        if (!state.booking_id){
+          const mirror = sessionStorage.getItem('pcl_booking_id_mirror');
+          if (mirror) state.booking_id = mirror;
+        }
+      }catch(_){}
+
+      return state.step || 1;
+    } catch (_) { clearStoredState(); return 0; }
+  }
+
+  function clearStoredState() {
+  sessionStorage.removeItem(PCL_STORE_KEY);
+  sessionStorage.removeItem(PCL_META_KEY);
+  try { sessionStorage.removeItem('pcl_booking_id_mirror'); } catch(_){}
+}
+
+
+  /* ===== Nav ===== */
+  function goBack(){ if (state.step>1){ const prev=state.step-1; state.maxStep=Math.max(state.maxStep||1,prev); go(prev); } }
+  function goNext(){ const next=Math.min(4,(state.step|0)+1); state.maxStep=Math.max(state.maxStep||1,next); go(next); }
+
+  /* ====================== DOM & UTILITIES ====================== */
+  const $app = document.getElementById('pcl-app');
+  const el = (t,a={},...k)=>{const e=document.createElement(t);
+    Object.entries(a).forEach(([x,v])=>{
+      if(x==='class') e.className=v;
+      else if(x==='style') e.style.cssText=v;
+      else if(x.startsWith('on')) e.addEventListener(x.slice(2),v);
+      else e.setAttribute(x,v);
+    });
+    k.flat().forEach(n=>{ if(typeof n==='string') e.append(document.createTextNode(n)); else if(n) e.append(n);});
+    return e;
+  };
+  function todayISO(){const d=new Date(); d.setHours(0,0,0,0); return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10);}
+  function fmtRange(iso){
+  if (!iso) return '—';
+  const s = new Date(iso), e = new Date(s.getTime() + SLOT_MIN*60000);
+  const opts = (fmtRange._opts ||= { hour:'numeric', minute:'2-digit' });
+  return `${s.toLocaleTimeString([], opts)}–${e.toLocaleTimeString([], opts)}`;
+  }
+  const inService = z => SERVICE_ZIPS.includes((z||'').slice(0,5));
+  const fullPhone = ()=> state.cc + state.phoneLocal.replace(/\D+/g,'');
+  const dayISO = iso => (iso || '').slice(0,10);
+
+  // Hoisted ET key builder (for server availability keys)
+  function etKey(iso){
+  const d = new Date(iso);
+  // memoize formatter on the function (no globals)
+  const fmt = (etKey._fmt ||= new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }));
+  const parts = Object.fromEntries(fmt.formatToParts(d).map(p => [p.type, p.value]));
+  const snapMin = Math.floor((parseInt(parts.minute,10)||0) / SLOT_MIN) * SLOT_MIN;
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${String(snapMin).padStart(2,'0')}`;
+}
+
+
+  function stepBar(i){
+  const labels = ['Details','Schedule','Extras','Review'];
+  const bar = el('div',{class:'pcl-stepbar'});
+  const frag = document.createDocumentFragment();
+  for (let idx=0; idx<labels.length; idx++){
+    const n = idx + 1;
+    const active = (n === i);
+    const canVisit = n <= (state.maxStep || 1);
+    frag.append(
+      el('div', {
+        class: `pcl-chip ${active?'active ':''}${canVisit?'':'disabled'}`,
+        onclick: () => { if (canVisit) go(n); }
+      }, `${n}. ${labels[idx]}`)
+    );
+  }
+  bar.appendChild(frag);
+  return bar;
+}
+
+function minutesUntil(isoTime){
+  const now = Date.now();
+  const target = new Date(isoTime).getTime();
+  return Math.floor((target - now) / 60000);
+}
+
+ function showToast(msg, opts = {}) {
+  // Inject one-time CSS (gentle variants, responsive sizing)
+  if (!document.getElementById('pcl-toast-css')) {
+    const style = document.createElement('style');
+    style.id = 'pcl-toast-css';
+    style.textContent = `
+      :root{
+        --pcl-toast-radius:12px;
+        --pcl-toast-shadow:0 10px 24px rgba(0,0,0,.12);
+        --pcl-toast-font:-apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        --pcl-info-bg:#f0f6ff;   --pcl-info-fg:#0b3170;   --pcl-info-br:#b9d3ff;
+        --pcl-ok-bg:#f0fff6;     --pcl-ok-fg:#0b5d37;     --pcl-ok-br:#bfe9d2;
+        --pcl-warn-bg:#fff9e6;   --pcl-warn-fg:#6b5300;   --pcl-warn-br:#ffe4a3;
+        --pcl-err-bg:#fff2f2;    --pcl-err-fg:#7a1111;    --pcl-err-br:#ffc9c9;
+      }
+      #pcl-toast{
+        position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+        max-width:520px; width:calc(100% - 32px);
+        background:#fff; box-shadow:var(--pcl-toast-shadow);
+        border-radius:var(--pcl-toast-radius); border:1px solid #E5E7EB;
+        padding:12px 44px 12px 14px; z-index:99999; display:none;
+        font:14px/1.45 var(--pcl-toast-font); color:#111;
+        max-height:40vh; overflow:auto; -webkit-overflow-scrolling:touch;
+      }
+      #pcl-toast .pcl-close{
+        position:absolute; top:8px; right:10px; cursor:pointer; border:0; background:transparent;
+        font:16px/1 var(--pcl-toast-font); color:inherit; opacity:.7;
+      }
+      #pcl-toast.info  { background:var(--pcl-info-bg);  color:var(--pcl-info-fg);  border-color:var(--pcl-info-br); }
+      #pcl-toast.ok    { background:var(--pcl-ok-bg);    color:var(--pcl-ok-fg);    border-color:var(--pcl-ok-br); }
+      #pcl-toast.warn  { background:var(--pcl-warn-bg);  color:var(--pcl-warn-fg);  border-color:var(--pcl-warn-br); }
+      #pcl-toast.error { background:var(--pcl-err-bg);   color:var(--pcl-err-fg);   border-color:var(--pcl-err-br); }
+      @media (min-width: 900px){
+        #pcl-toast{ bottom:28px; }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  let toast = document.getElementById('pcl-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'pcl-toast';
+    const btn = document.createElement('button');
+    btn.className = 'pcl-close';
+    btn.setAttribute('aria-label', 'Close');
+    btn.textContent = '×';
+    btn.addEventListener('click', () => { toast.style.display = 'none'; });
+    toast.appendChild(btn);
+    document.body.appendChild(toast);
+  }
+
+  // Variant logic (default to gentle "warn"). Back-compat: opts.color wins if set.
+  const variant = (opts.variant || '').toLowerCase();
+  toast.classList.remove('info','ok','warn','error');
+  if (opts.color) {
+    // manual color override (legacy usage)
+    toast.style.borderColor = opts.color;
+    toast.style.color = opts.color;
+  } else {
+    const v = variant || 'warn';
+    toast.classList.add(v);
+    toast.style.borderColor = ''; // class handles it
+    toast.style.color = '';
+  }
+
+  // Message
+  const text = String(msg || '').trim();
+  // Keep previous close button, replace content node
+  const closeBtn = toast.querySelector('.pcl-close');
+  toast.innerHTML = ''; // clear
+  const content = document.createElement('div');
+  content.textContent = text;
+  toast.appendChild(content);
+  toast.appendChild(closeBtn); // re-append close
+
+  // Show
+  toast.style.display = 'block';
+
+  // Auto-hide
+  if (toast._timeout) clearTimeout(toast._timeout);
+  const dur = Math.max(2000, Number(opts.duration)||5000);
+  toast._timeout = setTimeout(() => { toast.style.display = 'none'; }, dur);
+}
+
+
+
+
+  const prefersReduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function scrollToAppTop(){
+    const pad = 80;
+    const y = ($app.getBoundingClientRect().top + window.pageYOffset) - pad;
+    try { window.scrollTo({ top: Math.max(0, y), behavior: prefersReduceMotion ? 'auto' : 'smooth' }); }
+    catch(_) { window.scrollTo(0, Math.max(0, y)); }
+  }
+
+  function daysFromSlots(pickIso, dropIso){
+    if (!pickIso || !dropIso) return Math.max(1, state.days|0);
+    const start = new Date(pickIso).getTime();
+    const end   = new Date(dropIso).getTime();
+    const ms    = Math.max(0, end - start);
+    const days  = Math.ceil(ms / (24*60*60*1000)) || 1;
+    return days;
+  }
+
+  function refreshDays(){ state.days = daysFromSlots(state.pickupSlot, state.dropoffSlot); }
+
+
+
+  // --- ET-only formatters & helpers ---
+const fmtET = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  hour: 'numeric',
+  minute: '2-digit'
+});
+function keyET(iso){
+  const d = new Date(iso);
+  const ymd = new Intl.DateTimeFormat('en-CA', { timeZone:'America/New_York', year:'numeric', month:'2-digit', day:'2-digit' }).format(d); // YYYY-MM-DD
+  const hm  = new Intl.DateTimeFormat('en-GB', { timeZone:'America/New_York', hour:'2-digit', minute:'2-digit', hour12:false }).format(d); // HH:MM
+  return `${ymd}T${hm}`;
+}
+function etWindowLabel(startIso, minutes){
+  const s = new Date(startIso);
+  const e = new Date(s.getTime() + (minutes||15)*60000);
+  return `${fmtET.format(s)} – ${fmtET.format(e)} ET`;
+}
+
+
+  /* ====================== PROXY ====================== */
+  proxyPost('config').then(cfg=>{
+    if (!cfg || cfg.ok !== true) return;
+    if (!cfg.stripe_key_present) console.warn('[PCL] Stripe not configured on backend');
+  });
+
+  /* ===== Confirm-on-success (client idempotency) ===== */
+// One-shot confirm, with storage cleanup only on success
+let __confirmInflight = null;
+
+async function confirmOnceFromUrl(){
+  try{
+    const url = new URL(window.location.href);
+    const paid = url.searchParams.get('paid');
+    const bid  = url.searchParams.get('bid');
+    const sid  = url.searchParams.get('session_id');
+    if (!paid || !bid || !sid) return; // nothing to confirm on this page
+
+    // idempotent guard (avoid double submits on re-renders)
+    if (__confirmInflight) return await __confirmInflight;
+
+    // per-session key so a refresh in the same tab won't re-confirm
+    const storeKey = '__pcl_confirmed_'+sid;
+    if (sessionStorage.getItem(storeKey) === '1') return;
+
+    // longer timeout + simple retries (cold start safe)
+    const doConfirm = async ()=>{
+      // NOTE: if your proxyPost doesn't support opts yet, it will just ignore them (safe no-op).
+      return await proxyPost('confirm', { booking_id: bid, session_id: sid }, { timeoutMs: 15000, retries: 2, backoffMs: 600 });
+    };
+
+    __confirmInflight = doConfirm();
+    const resp = await __confirmInflight;
+
+    if (resp && resp.ok && resp.confirmed){
+      sessionStorage.setItem(storeKey, '1');
+
+      // ✅ SUCCESS: purge any persisted booking state so the form is clean next time
+      try{
+        // clear availability cache
+        if (typeof __slotCache?.clear === 'function') __slotCache.clear();
+
+        // clear any PCL keys we may have stored
+        for (let i=0; i<localStorage.length; i++){
+          const k = localStorage.key(i);
+          if (k && /^pcl[-_]/i.test(k)) { localStorage.removeItem(k); i--; }
+        }
+        for (let i=0; i<sessionStorage.length; i++){
+          const k = sessionStorage.key(i);
+          if (k && /^pcl[-_]/i.test(k)) { sessionStorage.removeItem(k); i--; }
+        }
+
+        // clear visible form fields (if present)
+        ['pcl-name','pcl-email','pcl-phone','pcl-pu-date','pcl-do-date','pcl-pu-time','pcl-do-time']
+          .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+
+        // clear in-memory state object (if used)
+        if (window.state){
+          state.customerName=''; state.email=''; state.phone='';
+          state.pickupSlot=''; state.dropoffSlot='';
+          state.pickupDate=''; state.dropoffDate='';
+        }
+      } catch(_) { /* non-fatal cleanup */ }
+
+      // render your success screen with server summary if you have one
+      if (typeof renderSuccess === 'function') renderSuccess(resp.booking);
+    } else {
+      // Not confirmed — keep state so user can retry
+      if (typeof showInlineError === 'function'){
+        showInlineError('Sorry—there was a problem confirming your booking. Please try again.');
+      }
+    }
+  } catch (ex){
+    if (typeof showInlineError === 'function'){
+      showInlineError('Network hiccup while confirming. Please try again.');
+    }
+  } finally {
+    __confirmInflight = null;
+  }
+}
+confirmOnceFromUrl();
+
+
+  // Unified proxy POST with correlation id + strong logging + client timeout
+function corrId() {
+  const base = (window.booking_id || 'NO_BKG');
+  const n = Math.random().toString(36).slice(2, 8);
+  return `${base}-${Date.now()}-${n}`;
+}
+
+async function proxyPost(fn, data = {}, opts = {}) {
+  // ---------- Config ----------
+  const baseUrl =
+    opts.baseUrl ||
+    window.PCL_PROXY_URL ||
+    window.PCL_API_URL ||
+    (typeof PROXY_URL !== 'undefined' ? PROXY_URL : null);
+
+  if (!baseUrl) {
+    throw new Error('[proxyPost] No backend URL configured (set window.PCL_PROXY_URL or PROXY_URL)');
+  }
+
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 15000;
+  const retries   = Number.isFinite(opts.retries)   ? opts.retries   : 0;
+  let   backoffMs = Number.isFinite(opts.backoffMs) ? opts.backoffMs : 400;
+
+  const id = corrId();
+  const payload = { fn, ...(data || {}), corr_id: id };
+
+  // ---------- Core runner with timeout ----------
+  const runOnce = async () => {
+    const started   = performance.now();
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort('client_timeout'), timeoutMs);
+
+    try {
+      console.log('[proxyPost] start', { id, fn });
+
+      const res = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(data && data.__prewarm ? { 'X-Prewarm': '1' } : {})
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+
+      const txt = await res.text();
+      let json; try { json = JSON.parse(txt); } catch { json = { parse_error:true, raw:txt }; }
+
+      console.log('[proxyPost] done', {
+        id, status: res.status, dur_ms: Math.round(performance.now() - started), size: txt.length
+      });
+
+      if (!res.ok) {
+        const msg = (json && (json.error || json.message)) || `HTTP ${res.status}`;
+        const err = new Error(msg);
+        err.status = res.status;
+        err.body = txt;
+        throw err;
+      }
+      return json;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // ---------- Retry wrapper ----------
+  let attempt = 0, lastErr;
+  while (attempt <= retries) {
+    try {
+      return await runOnce();
+    } catch (e) {
+      lastErr = e;
+      // Retry on timeouts/abort/5xx; otherwise rethrow
+      const msg = String(e && e.message || e);
+      const isAbort = /abort|timeout/i.test(msg);
+      const is5xx   = (e && e.status && e.status >= 500);
+      if (attempt === retries || (!isAbort && !is5xx)) throw e;
+
+      await new Promise(r => setTimeout(r, backoffMs));
+      backoffMs = Math.min(backoffMs * 2, 2000);
+      attempt++;
+      console.warn('[proxyPost] retry', { id, fn, attempt, reason: msg });
+    }
+  }
+  throw lastErr || new Error('[proxyPost] unknown error');
+}
+
+
+
+
+/* ====================== AVAILABILITY & SLOTS (server-first) ====================== */
+// returns { slots: [{start: ISO}], available_keys: ['YYYY-MM-DDTHH:mm', ...] }
+async function fetchServerSlots(dateISO, kind, opts = {}){
+  const which = (typeof kind === 'string' && kind) ? kind : 'any';
+  const isPickup = which === 'pickup' || which === 'pickup_priority' || kind === 'pickup';
+  const wantPriority = !!(opts.priority ?? state.priority);
+
+  if (!REMOTE_AVAIL) return { slots: [], available_keys: [] };
+
+  // Helper to request once
+  const req = (payload) => proxyPost('availability', payload).catch(()=>({}));
+
+  // Build common payload
+  const common = { date: dateISO };
+
+  // When priority is desired for pickup, try BOTH in parallel:
+  //  1) a payload that includes multiple priority signals
+  //  2) a plain pickup payload (fallback)
+  if (wantPriority && isPickup){
+    const priPayload = {
+      ...common,
+      which: 'pickup_priority',   // some servers key off which
+      priority: true,             // others look for this boolean
+      mode: 'priority',           // belt-and-suspenders
+      lead_minutes: 20            // explicit lead time if supported
+    };
+    const normPayload = { ...common, which: 'pickup' };
+
+    const [pri, norm] = await Promise.all([req(priPayload), req(normPayload)]);
+
+    const priKeys  = Array.isArray(pri?.available_keys)  ? pri.available_keys  : [];
+    const normKeys = Array.isArray(norm?.available_keys) ? norm.available_keys : [];
+
+    // Helper: earliest (lex sort works for YYYY-MM-DDTHH:mm)
+    const earliest = (arr)=> arr && arr.length ? [...arr].sort()[0] : null;
+
+    const priBest  = earliest(priKeys);
+    const normBest = earliest(normKeys);
+
+    // Prefer priority if it produced any keys, especially if earlier than normal
+    if (priKeys.length && (!normBest || (priBest && priBest <= normBest))){
+      return { slots: Array.isArray(pri.slots)?pri.slots:[], available_keys: priKeys };
+    }
+    // otherwise fall back to normal response
+    return { slots: Array.isArray(norm.slots)?norm.slots:[], available_keys: normKeys };
+  }
+
+  // Non-pickup, or priority not requested: single call
+  const payload = { ...common, which };
+  const j = await req(payload);
+  return {
+    slots: Array.isArray(j?.slots) ? j.slots : [],
+    available_keys: Array.isArray(j?.available_keys) ? j.available_keys : []
+  };
+}
+
+
+
+const getLeadMinutes = () => (state.priority ? 20 : 60);
+
+// cache + in-flight de-dupe with TTL
+const __slotCache    = new Map();  // key -> { data:[{start}], ts:number }
+const __slotInflight = new Map();  // key -> Promise<[...data]>
+const __SLOT_TTL_MS  = 60 * 1000;  // 60s TTL to avoid stale availability
+let   __fillTimesRequestSeq = 0;   // latest-only guard
+
+function __isFresh(entry){
+  return entry && Array.isArray(entry.data) && (Date.now() - entry.ts) < __SLOT_TTL_MS;
+}
+
+function clearSlotsCache(dateISO){
+  if (!dateISO) return;
+  for (const m of [__slotCache, __slotInflight]){
+    for (const k of m.keys()) if (k.startsWith(dateISO+'|')) m.delete(k);
+  }
+}
+
+function generateLocalSlots(dateISO){
+  const out=[], d=new Date(dateISO+'T00:00:00');
+  for(let h=OPEN_HOUR; h<CLOSE_HOUR; h++){
+    for(let m=0;m<60;m+=SLOT_MIN){
+      const s=new Date(d); s.setHours(h,m,0,0);
+      out.push({start:s.toISOString()});
+    }
+  }
+  return out; // lead-time enforced later
+}
+
+
+// Remote-first: don’t show local guesses; paint only server-vetted slots
+async function fetchSlots(dateISO, kind, forceReload = false){
+  const key = dateISO + '|' + (kind || '') + '|' + (state.priority ? 'P' : 'N');
+
+  if (forceReload){
+    __slotCache.delete(key);
+    __slotInflight.delete(key);
+  }
+
+  if (__slotInflight.has(key)) return (await __slotInflight.get(key)).slice();
+  if (__slotCache.has(key))    return __slotCache.get(key).slice();
+
+  const task = (async ()=>{
+    try{
+      const remote = await fetchServerSlots(dateISO, kind, { priority: state.priority });
+      const local  = generateLocalSlots(dateISO);
+
+      let merged = [];
+      if (Array.isArray(remote.available_keys)) {
+        const allowed = new Set(remote.available_keys);
+        merged = local.filter(s => allowed.has(etKey(s.start)));
+      }
+      __slotCache.set(key, merged);
+      return merged;
+    } finally {
+      __slotInflight.delete(key);
+    }
+  })();
+
+  __slotInflight.set(key, task);
+  return (await task).slice();
+}
+
+
+
+// --- Prewarm: seed both pickup & dropoff caches for a date (fire-and-forget) ---
+function prewarmAvailability(dateISO){
+  try{
+    if (!REMOTE_AVAIL) return;
+    const d = (dateISO && dateISO.slice(0,10)) || todayISO();
+    // Start both requests; we don't need to await — the cache will be ready
+    fetchSlots(d, 'pickup').catch(()=>{});
+    fetchSlots(d, 'dropoff').catch(()=>{});
+  }catch(_){}
+}
+
+// (optional) expose for later use (Step 1 "Continue" can still call this)
+window.pclPrewarmAvailability = prewarmAvailability;
+
+
+
+const isAfterPickup = (startIso) => !state.pickupSlot || !startIso || new Date(startIso) > new Date(state.pickupSlot);
+
+
+
+async function fillTimes(selectEl, dateISO, enforceAfterPickup=false, autoPick=true, forceReload=false){
+  const mySeq = ++__fillTimesRequestSeq;
+
+  // Local, robust "Next" button toggler (no external dependency)
+  const updateNextBtn = (disabled, reason) => {
+    const btn = document.querySelector('.pcl-actions .pcl-btn:not(.secondary)');
+    if (!btn) return;
+    if (disabled) {
+      btn.setAttribute('disabled','true');
+      if (reason) btn.title = reason; else btn.removeAttribute('title');
+    } else {
+      btn.removeAttribute('disabled');
+      btn.removeAttribute('title');
+    }
+  };
+
+  // Always start disabled while loading
+  selectEl.disabled = true;
+  selectEl.innerHTML = '<option selected disabled>Loading times…</option>';
+
+  const today = todayISO();
+  const minStart = (dateISO===today) ? new Date(Date.now()+getLeadMinutes()*60000) : null;
+  const isPickupSel  = (selectEl.id === 'pcl-pu-time');
+
+  const paint = (list) => {
+    // If this call is stale (a newer fill started), re-enable the control and bail safely
+    if (mySeq !== __fillTimesRequestSeq) {
+      selectEl.disabled = false;
+      return;
+    }
+
+    const filtered = (list||[]).filter(sl=>{
+      const s = new Date(sl.start), t = s.getTime(), hr = s.getHours();
+      if (!Number.isFinite(t)) return false;
+      if (hr < OPEN_HOUR || hr >= CLOSE_HOUR) return false;
+      if (minStart && s < minStart) return false;
+      if (enforceAfterPickup && !isAfterPickup(sl.start)) return false;
+      return true;
+    });
+
+    selectEl.innerHTML = '';
+
+    if (!filtered.length){
+      const msg = (dateISO === todayISO())
+        ? (isPickupSel ? 'No pickup times remaining today' : 'No return times remaining today')
+        : (isPickupSel ? 'No pickup times for this date'   : 'No return times for this date');
+
+      selectEl.append(Object.assign(document.createElement('option'),{textContent:msg,disabled:true,selected:true}));
+
+      if (isPickupSel) state.pickupSlot = '';
+      else             state.dropoffSlot = '';
+
+      updateNextBtn(true, isPickupSel ? 'Pick another pickup date' : 'Pick another return date');
+    } else {
+      if (!autoPick){
+        const prompt = Object.assign(document.createElement('option'), { textContent: isPickupSel ? 'Please select a pickup time' : 'Please select a return time', disabled:true, selected:true });
+        selectEl.append(prompt);
+        if (isPickupSel) state.pickupSlot = '';
+        else             state.dropoffSlot = '';
+      }
+
+      filtered.forEach(sl=>{
+        selectEl.append(el('option', { value: sl.start }, fmtRange(sl.start)));
+      });
+
+      if (autoPick){
+        const chosen = filtered[0] && filtered[0].start;
+        if (chosen){
+          selectEl.value = chosen;
+          if (isPickupSel) state.pickupSlot = chosen;
+          else             state.dropoffSlot = chosen;
+        }
+      }
+
+      updateNextBtn(false);
+    }
+
+    // Ensure the control is enabled regardless of path
+    selectEl.disabled = false;
+  };
+
+    // Remote-first — keep disabled until live availability arrives
+    selectEl.innerHTML = '<option selected disabled>Loading live availability…</option>';
+    const merged = await fetchSlots(dateISO, isPickupSel ? 'pickup' : 'dropoff', forceReload);
+
+    paint(merged);
+
+
+  // keep state synced on manual change (attach once)
+  if (!selectEl.dataset.hasSlotChangeListener) {
+    selectEl.addEventListener('change', ()=>{
+      if (selectEl.id === 'pcl-pu-time') state.pickupSlot = selectEl.value;
+      if (selectEl.id === 'pcl-do-time') state.dropoffSlot = selectEl.value;
+    });
+    selectEl.dataset.hasSlotChangeListener = '1';
+  }
+}
+
+
+// When the tab becomes visible, just refresh caches in the background.
+// Do NOT touch user selections or repaint dropdowns here.
+document.addEventListener('visibilitychange', ()=>{
+  if (document.visibilityState !== 'visible') return;
+  try{
+    const puDateEl = document.getElementById('pcl-pu-date');
+    const doDateEl = document.getElementById('pcl-do-date');
+    const puDate = puDateEl && puDateEl.value ? puDateEl.value : null;
+    const doDate = doDateEl && doDateEl.value ? doDateEl.value : null;
+    if (puDate) fetchSlots(puDate, 'pickup',  true).catch(()=>{});
+    if (doDate) fetchSlots(doDate, 'dropoff', true).catch(()=>{});
+  }catch(_){}
+});
+
+
+  /* ====================== ADDRESS AUTOCOMPLETE (Mapbox; ZIP-limited) ====================== */
+  function attachAutocomplete(inputEl, zipEl){
+    if (inputEl.dataset.acInit === '1') return;
+    inputEl.dataset.acInit = '1';
+
+        // harden against browser autofill bubbles
+    inputEl.setAttribute('autocomplete','off');
+    inputEl.setAttribute('autocapitalize','off');
+    inputEl.setAttribute('autocorrect','off');
+    inputEl.setAttribute('spellcheck','false');
+    inputEl.setAttribute('inputmode','search');
+
+    // single, custom popover (no native datalist)
+    const pop = document.createElement('div');
+    pop.className = 'pcl-suggest-list';   // you already have CSS for this
+    pop.style.display = 'none';
+
+    (function mount(){
+      const p = inputEl.parentNode;
+      if (!p) { requestAnimationFrame(mount); return; }
+      // position under the input
+      p.style.position = p.style.position || 'relative';
+      p.appendChild(pop);
+    })();
+
+function closePop(){ pop.style.display = 'none'; pop.innerHTML = ''; }
+function openPop(){ pop.style.display = ''; }
+
+// markJustFilled: collapse pop and keep focus stable
+function markJustFilled(){
+  inputEl.dataset.justFilled = '1';
+  closePop();
+  // no blur/focus ping-pong needed when we own the popover
+}
+
+
+    // Map of pretty string -> zip
+    const lastResults = new Map();
+
+    function zipFromFeature(f){
+      let z = (f.properties && f.properties.postcode) || '';
+      if (!z && Array.isArray(f.context)){
+        const pc = f.context.find(c => (c.id||'').startsWith('postcode'));
+        if (pc && pc.text) z = pc.text;
+      }
+      return (z||'').slice(0,5);
+    }
+
+    function pretty(f){
+      const num = f.address || '';
+      const st  = (f.text || '').trim();
+      const left = [num, st].filter(Boolean).join(' ');
+      const place = (f.context||[]).reduce((acc,c)=>{
+        if ((c.id||'').startsWith('place')) acc.city = c.text;
+        if ((c.id||'').startsWith('region')) acc.st   = c.short_code ? c.short_code.split('-').pop() : c.text;
+        return acc;
+      }, {city:'', st:''});
+      const right = [place.city, place.st].filter(Boolean).join(', ');
+      return left ? [left, right].filter(Boolean).join(', ') : (f.place_name || '');
+    }
+
+    const tryCanon = ()=>{
+      const v=(inputEl.value||'').trim().toLowerCase();
+      if (PWM.synonyms.includes(v)){
+        inputEl.value = `${PWM_DISPLAY_LABEL} — ${PWM.address}`;
+        if (zipEl) zipEl.value = PWM.zip;
+        markJustFilled();
+        return true;
+      }
+      return false;
+    };
+
+    inputEl.addEventListener('change', ()=>{
+      if (tryCanon()) return;
+      const prettyVal = (inputEl.value || '').trim();
+      const metaZip = lastResults.get(prettyVal);
+      if (metaZip && zipEl) zipEl.value = metaZip.slice(0,5);
+      markJustFilled();
+    });
+
+    // Debounced type-ahead with cache + abort
+    let timer = null;
+    const cache = new Map();
+    let inflight = null;
+
+    inputEl.addEventListener('input', ()=>{
+      if (inputEl.dataset.justFilled === '1'){
+        inputEl.dataset.justFilled = '0';
+        closePop();
+      return;
+      }
+
+
+      const q = inputEl.value.trim();
+      clearTimeout(timer);
+
+      if (q.length < 3){
+        closePop(); pop.innerHTML = ''; lastResults.clear();
+        return;
+      }
+
+      timer = setTimeout(async ()=>{
+        if (inflight) inflight.abort();
+        inflight = new AbortController();
+
+        try{
+          let data;
+          if (cache.has(q)) {
+            data = cache.get(q);
+          } else {
+            const url = new URL(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json`);
+            url.searchParams.set('access_token', MAPBOX_TOKEN);
+            url.searchParams.set('autocomplete','true');
+            url.searchParams.set('country','US');
+            url.searchParams.set('limit','7');
+            url.searchParams.set('language','en');
+            url.searchParams.set('fuzzyMatch','true');
+            // 👇 include points of interest alongside address-y results
+            url.searchParams.set('types','poi,poi.landmark,address,place');
+            url.searchParams.set('proximity', MAPBOX_PROX.join(','));
+            const r = await fetch(url.toString(), { signal: inflight.signal, cache:'no-store' });
+            data = await r.json();
+            cache.set(q, data);
+          }
+
+          const feats = (data && data.features) || [];
+          const filtered = feats.filter(f=>{
+            const types = Array.isArray(f.place_type) ? f.place_type : [];
+            // allow address-like AND points of interest, still gated by allowed ZIPs
+            const allowedType = types.some(t =>
+              t === 'address' || t === 'street' || t === 'place' ||
+              t === 'neighborhood' || t === 'locality' ||
+              t === 'poi' || t === 'poi.landmark'
+            );
+            return allowedType && SERVICE_ZIPS.includes(zipFromFeature(f));
+          });
+
+
+          closePop(); pop.innerHTML = ''; lastResults.clear();
+          if (!filtered.length) return;
+
+          const frag = document.createDocumentFragment();
+          filtered.forEach(f=>{
+            const ptxt = pretty(f); if (!ptxt) return;
+            const item = document.createElement('div');
+            item.className = 'pcl-suggest-item';
+            item.setAttribute('role','option');
+            item.textContent = ptxt;
+
+      // click/tap selects immediately
+      item.addEventListener('mousedown', e => e.preventDefault()); // prevent input blur on mousedown
+      item.addEventListener('click', () => {
+        inputEl.value = ptxt;
+        if (zipEl) zipEl.value = (zipFromFeature(f) || '').slice(0,5);
+        markJustFilled();
+        inputEl.dispatchEvent(new Event('change', { bubbles:true }));
+      });
+
+      frag.appendChild(item);
+      lastResults.set(ptxt, zipFromFeature(f) || '');
+    });
+    pop.appendChild(frag);
+    openPop();
+
+        } catch(_) {
+  closePop();
+  lastResults.clear();
+}
+
+      }, 300);
+    });
+
+    // Also clear on blur to avoid “sticky” bubbles in some browsers
+    // close on blur, but allow clicks inside the pop
+inputEl.addEventListener('blur', () => setTimeout(closePop, 0));
+// esc to dismiss
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closePop(); return; }
+  if (e.key === 'Enter' && pop.style.display !== 'none'){
+    const first = pop.querySelector('.pcl-suggest-item');
+    if (first){ first.click(); e.preventDefault(); }
+  }
+});
+
+  }
+
+  /* ====================== BAG PRICING ====================== */
+  const PASS_TIERS = [
+    { id: 'solo',    name: 'Solo Traveler',        range: '1-2 bags', maxBags: 2, day1: 49 },
+    { id: 'couples', name: 'Couples Traveler',     range: '3-4 bags', maxBags: 4, day1: 99 },
+    { id: 'family',  name: 'Family Traveler',      range: '5-6 bags', maxBags: 6, day1: 129 },
+    { id: 'large',   name: 'Large Group Traveler', range: '7-8 bags', maxBags: 8, day1: 159 },
+  ];
+
+  const EXTRA_BAG_DAY1 = 15;
+  const EXTRA_BAG_EXTRA_DAY = Math.ceil(EXTRA_BAG_DAY1 * 0.5);
+
+  function passTierForBags(bags){
+    const tier = PASS_TIERS.find(t => bags <= t.maxBags) || PASS_TIERS[PASS_TIERS.length - 1];
+    const extraBags = Math.max(0, bags - 8);
+    return { tier, extraBags };
+  }
+  function passNameForBags(bags){
+    const r = passTierForBags(bags);
+    return r.extraBags ? (r.tier.name + ' + ' + r.extraBags + ' extra') : r.tier.name;
+  }
+  function priceForBagsAndDays(bags, days){
+    const b = Math.max(1, Number(bags) | 0);
+    const d = Math.max(1, Number(days) | 0);
+    const r = passTierForBags(b);
+    const day1Base    = Number(r.tier.day1) || 0;
+    const day1Extras  = (Number(r.extraBags) || 0) * EXTRA_BAG_DAY1;
+    const firstDay    = day1Base + day1Extras;
+    const extraDayBase   = Math.ceil(day1Base * 0.5);
+    const extraDayExtras = (Number(r.extraBags) || 0) * EXTRA_BAG_EXTRA_DAY;
+    const perExtraDay    = extraDayBase + extraDayExtras;
+    const total = firstDay + (d - 1) * perExtraDay;
+    return { tier: r.tier, extraBags: r.extraBags, firstDay, perExtraDay, total };
+  }
+  function isPWMAddress(addr, zip){
+    const a = (addr||'').toLowerCase();
+    const z = (zip||'').trim();
+    if (z === '04102'){
+      if (a.includes('westbrook') || a.includes('jetport') || a.includes('airport') || a.includes('pwm')) return true;
+    }
+    return PWM.synonyms.some(s => a.includes(s)) || a.includes('1001 westbrook');
+  }
+  function calcTotals(){
+    const p = priceForBagsAndDays(state.bags, state.days);
+    const extrasAmt = state.extras.reduce((s, x) => s + (x.amount || 0), 0);
+    return {
+      base: p.total,
+      day1: p.firstDay,
+      perExtraDay: p.perExtraDay,
+      passName: passNameForBags(state.bags),
+      extrasAmt,
+      total: p.total + extrasAmt
+    };
+  }
+
+  /* ====================== STEP 1 ====================== */
+function step1(){
+  const c = el('div');
+  c.append(el('h2', { class: 'pcl-title' }, 'Choose your pass'), stepBar(1));
+
+  // ——— tiny helpers (lean but identical behavior) ———
+  const dollars    = n => '$' + (+n).toFixed(n%1 ? 2 : 0);
+  const TIER_CLASS = { solo:'pass-solo', couples:'pass-couples', family:'pass-family', large:'pass-large' };
+  const TIER_NAME  = { solo:'Solo Pass',  couples:'Couples Pass',  family:'Family Pass',  large:'Platinum Group Pass' };
+
+  // default sane state (preserve originals)
+  state.bags ||= 2;
+  state.days ||= 1;
+  state.cc   ||= '+1';
+
+  const hero = el('div', { class: 'pcl-passhero' });
+
+  function buildBagRow(){
+    const row = el('div', { class: 'bagrow pop', role:'img', 'aria-label': `${state.bags} bags visual` });
+    const shown = Math.min(6, state.bags|0);
+    Array.from({length: shown}, () => row.append(el('div', { class:'bigbag' })));
+    if (state.bags > 6) row.append(el('div', { class:'morebadge' }, '+'));
+    return row;
+  }
+
+  function renderHero(){
+    const p = priceForBagsAndDays(state.bags, state.days);
+    hero.className = 'pcl-passhero ' + (TIER_CLASS[p.tier.id] || 'pass-large') + ' animate';
+    hero.innerHTML = '';
+    // retrigger shine animation (must keep)
+    hero.classList.remove('shine'); void hero.offsetWidth; hero.classList.add('shine');
+
+    const totalLabel = state.days === 1 ? 'for 1 day' : ('for ' + state.days + ' days');
+
+    hero.append(
+      el('div', { class: 'head' },
+        el('div', { class: 'titlecol' },
+          el('div', { class: 'title' }, TIER_NAME[p.tier.id] || 'Platinum Group Pass'),
+          el('div', { class: 'pill'  }, 'Fits: ' + p.tier.range)
+        ),
+        el('div', { class: 'price-badge' },
+          el('div', { class: 'amt' }, dollars(p.total)),
+          el('div', { class: 'badge-sub' }, totalLabel)
+        )
+      ),
+      el('div', { class: 'sub' }, 'We pick up where you want, drop-off when you need. Up to 24 hours included.'),
+      el('div', { class: 'divider' }),
+      el('div', { class: 'ctr-grid' },
+        el('div', { class: 'ctr-block' },
+          el('div', { class: 'ctr-label' }, 'How many bags do you need picked up and stored?'),
+          el('div', { class: 'stepwrap' },
+            el('div', { class:'pcl-stepper' },
+              el('button', { 'aria-label':'Decrease', onclick: () => { state.bags = Math.max(1, state.bags - 1); renderHero(); } }, '–'),
+              el('span',   { class: 'num', 'aria-live':'polite' }, String(state.bags)),
+              el('button', { 'aria-label':'Increase', onclick: () => { state.bags = Math.min(30, state.bags + 1); renderHero(); } }, '+')
+            )
+          ),
+          el('div', { class: 'bagwrap' }, buildBagRow())
+        )
+      )
+    );
+  }
+  renderHero();
+
+  // trust row (mapped to avoid repetition; same DOM result)
+  const trustItems = [
+    ['🛡️','Secure handling'],
+    ['⏱️','On-time windows'],
+    ['⭐','5/5 from travelers on Google'],
+    ['🏙️','Portland-owned']
+  ];
+  const trust = el('div', { class: 'pcl-trust' },
+    ...trustItems.flatMap(([_icon, _text], i) => i
+      ? [el('span', { class:'t-dot' }, '·'), el('span', { class:'t-item' }, _icon, el('span', {}, _text))]
+      :  [el('span', { class:'t-item' }, _icon, el('span', {}, _text))]
+    )
+  );
+
+  // contact card
+  const contactWrap = el('div', { class: 'pcl-contact' },
+    el('label', {}, 'Name'),
+    el('input', { class:'pcl-inp', placeholder:'Full name', value: state.name || '', autocomplete:'name', autocapitalize:'words', autocorrect:'off' }),
+    el('label', {}, 'Email'),
+    el('input', { class:'pcl-inp', type:'email', placeholder:'you@example.com', value: state.email || '', autocomplete:'email', inputmode:'email' }),
+    el('label', {}, 'Mobile'),
+    el('div', { class:'cc-wrap' },
+      (function(){ const s = el('select', { class:'pcl-inp cc-select' }); s.innerHTML = '<option value="+1">🇺🇸 +1</option>'; s.value = state.cc || '+1'; return s; })(),
+      el('input', { class:'pcl-inp phone-input', type:'tel', placeholder:'(207) 555-0123', value: state.phoneLocal ? formatDisplayUS(state.phoneLocal) : '', autocomplete:'tel', inputmode:'tel', enterkeyhint:'next' })
+    ),
+    el('div', { class:'help' }, 'We’ll text your confirmation. No spam—ever.')
+  );
+
+  const [nameInp, emailInp] = contactWrap.querySelectorAll('input');
+  const ccSel    = contactWrap.querySelector('select');
+  const phoneInp = contactWrap.querySelector('.phone-input');
+
+    // --- Early availability prewarm while typing email/phone ---
+  function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+  const prewarmSoon = () => prewarmAvailability(state.pickupDate || todayISO());
+
+  // Kick off after brief typing pause (and on first focus)
+  const prewarmDebounced = debounce(prewarmSoon, 300);
+  emailInp.addEventListener('input', prewarmDebounced);
+  phoneInp.addEventListener('input', prewarmDebounced);
+  emailInp.addEventListener('focus', prewarmSoon, { once:true });
+  phoneInp.addEventListener('focus', prewarmSoon, { once:true });
+  // if country code changes, that also indicates intent
+  ccSel.addEventListener('change', prewarmSoon);
+
+
+  function formatDisplayUS(digits){
+    const d = (digits || '').replace(/\D/g,'').slice(0,10);
+    if (d.length < 4)  return d;
+    if (d.length < 7)  return `(${d.slice(0,3)}) ${d.slice(3)}`;
+    return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+  }
+  phoneInp.addEventListener('input', () => {
+    const raw = phoneInp.value.replace(/\D/g,'').slice(0,10);
+    phoneInp.value = formatDisplayUS(raw);
+  });
+
+  const checklist = el('div', { class:'pcl-err hidden' });
+
+  function syncStateFromInputs(){
+    state.name       = (nameInp.value || '').trim();
+    state.email      = (emailInp.value || '').trim();
+    state.cc         = ccSel.value || '+1';
+    state.phoneLocal = (phoneInp.value || '').replace(/\D/g,'');
+  }
+  const onInput = () => { syncStateFromInputs(); checklist.classList.add('hidden'); };
+  [nameInp, emailInp, ccSel, phoneInp].forEach(x => x.addEventListener('input', onInput));
+
+  function missingFields(){
+    const miss = [];
+    if (!state.name) miss.push('name');
+    if (!/^\S+@\S+\.\S+$/.test(state.email)) miss.push('email');
+    if (!(state.phoneLocal && state.phoneLocal.length === 10)) miss.push('telephone');
+    return miss;
+  }
+
+  function onNext(){
+    syncStateFromInputs();
+    const miss = missingFields();
+    if (miss.length){
+      checklist.textContent = 'Enter: ' + miss.join(' • ');
+      checklist.classList.remove('hidden');
+      checklist.scrollIntoView({ behavior:'smooth', block:'nearest' });
+      return;
+    }
+    go(2);
+  }
+
+  const next    = el('button', { class:'pcl-btn', onclick:onNext }, 'Continue - Choose Your Pickup Time');
+  const ctaHelp = el('div', { class:'pcl-help', style:'text-align:center;margin-top:6px' }, 'We’re here to help! If you have questions, please call us at 207 747 8336');
+
+  c.append(hero, trust, contactWrap, checklist, el('div', { class:'pcl-actions' }, next), ctaHelp);
+  return c;
+}
+
+  /* ====================== STEP 2 — Schedule ====================== */
+function step2(){
+  const c = el('div');
+  c.append(el('h2',{class:'pcl-title'},'Schedule'), stepBar(2));
+
+  // 🎯 INSERT: Countdown toast warning for pickup slot
+  const puISO = state.pickupSlot;
+  if (puISO){
+    const mins = minutesUntil(puISO);
+    if (mins <= 60 && mins >= 15){
+      showToast(`⚠️ Only ${mins} minutes left to book this pickup window!`, { duration: 6000 });
+    } else if (mins < 15 && mins > 0){
+      showToast(`⏳ Hurry! Just ${mins} minutes left to reserve this pickup.`, { duration: 7000 });
+    } else if (mins <= 0){
+      showToast(`This pickup window may no longer be available. Please pick a later time.`, { duration: 8000 });
+    }
+  }
+
+  const err = el('div',{class:'pcl-err'});
+
+  // Reused display string for PWM curbside/airport
+  const PWM_LABEL = `${PWM_DISPLAY_LABEL} — ${PWM.address}`;
+
+  // Small helpers (no behavior change)
+  const show = (node, on) => { node.style.display = on ? '' : 'none'; };
+  const clearSecondWindow = () => { state.dropoffAddress=''; state.dropoffZip=''; state.dropoffSlot=''; };
+  const refreshAll = (alsoRideBtns=false) => {
+    if (alsoRideBtns) updateRideButtons();
+    renderQs(); renderDrop(); renderTotal();
+  };
+
+  // Respect prefill PWM once
+  if (state.prefillDropPWM && !state.dropoffAddress){
+    state.dropoffAddress = PWM.address; state.dropoffZip = PWM.zip;
+  }
+
+  // ---------- PICKUP CARD ----------
+  const puAddr = el('input',{id:'pcl-pu-addr',class:'pcl-inp',
+  placeholder:'Pickup address for your baggage (e.g., 5 Fore St, Portland, ME)',
+  value: state.pickupAddress || '',
+  autocomplete:'off', autocapitalize:'off', autocorrect:'off', spellcheck:'false', inputmode:'search'
+});
+  const puZipHidden = el('input',{type:'hidden',id:'pcl-pu-zip',value:state.pickupZip||''});
+
+  // Pickup date input (create before any use)
+  const puDate = el('input', {
+    id: 'pcl-pu-date', class: 'pcl-inp', type: 'date',
+    min: todayISO(), value: state.pickupDate || todayISO()
+  });
+
+  const puTime = el('select',{id:'pcl-pu-time',class:'pcl-inp'});
+
+  // Priority toggle (mirror into extras list)
+  state.priority = !!state.priority || state.extras.some(x=>x.id===ADDONS.priority.id);
+  const priChk = el('input',{type:'checkbox',autocomplete:'off'}); 
+  priChk.checked = !!state.priority;
+  function syncPriorityExtra(){
+    const has = state.extras.some(x=>x.id===ADDONS.priority.id);
+    if (priChk.checked && !has) state.extras.push(ADDONS.priority);
+    if (!priChk.checked && has) state.extras = state.extras.filter(x=>x.id!==ADDONS.priority.id);
+    state.priority = !!priChk.checked;
+  }
+
+  const pickCard = el('div',{class:'pcl-card'},
+    el('h3',{},'Baggage pickup'),
+    el('div',{}, el('label',{},'Pickup address'), puAddr, puZipHidden),
+    (function(){ // Suggested spots
+      const wrap = el('div',{class:'pcl-suggest'});
+      const btn  = el('button',{class:'pcl-suggest-toggle',type:'button'},'Suggested spots ▾');
+      const pop  = el('div',{class:'pcl-suggest-pop'});
+      SUGGESTED_PICKS.forEach(s=>{
+        pop.append(el('button',{class:'pcl-chipbtn sm',type:'button',onclick:()=>{
+          const label = `${s.label} — ${s.addr}`;
+          puAddr.value = label; puZipHidden.value = s.zip;
+          state.pickupAddress = label; state.pickupZip = s.zip;
+          state.pickupCanon   = s.addr;             // ← canonical street address
+          wrap.classList.remove('open'); maybeAdvanceQ();
+        }}, s.label));
+      });
+
+      btn.addEventListener('click',()=>wrap.classList.toggle('open'));
+      wrap.append(btn,pop); return wrap;
+    })(),
+    el('div',{class:'pcl-row-3'},
+      el('div',{}, el('label',{},'Pickup date'), puDate),
+      el('div',{}, el('label',{},'Pickup time window'), puTime)
+    ),
+    el('div',{class:'pcl-priority'},
+      priChk, el('span',{},'Last minute booking? Priority pickup +$12 (to you in 30 mins or less)')
+    )
+  );
+
+  // ---------- INLINE QUESTION 1: Ride? ----------
+  const rideQ = el('div',{class:'pcl-inlineq',style:'display:none'});
+
+  // Title + dynamic price badge (upper‑right)
+  const rideTitle   = el('h4',{},'Would you like a ride to Portland Airport with your bags?');
+  const rideBadge   = el('div',{class:'pcl-badge', id:'pcl-ride-badge', style:'display:none'}, '$49');
+  const rideHeadRow = el('div',{class:'rowhead'}, rideTitle, rideBadge);
+
+  const rideSub   = el('div',{class:'sub'},'When it’s time, we’ll pick you up with bags already loaded and take you to the airport.');
+  const rideBtns  = el('div',{class:'pcl-choices'});
+
+  const rideYes = el('button',{class:'pcl-choice',onclick:()=>{
+    setRide(null);                        // ← no auto-pick
+    rideAnswered = true;  curbAnswered = false; // curbside must be re-answered if later "No ride"
+    renderSeats(); refreshAll(true);
+  }},'Yes');
+
+  const rideNo  = el('button',{class:'pcl-choice',onclick:()=>{
+    clearRide();
+    rideAnswered = true;  curbAnswered = false; // force fresh curbside choice
+    state.curbside = null;
+    renderSeats(); refreshAll(true);
+  }},'No');
+
+  rideBtns.append(rideYes,rideNo);
+
+  function rideCurrentPrice(){
+    return (state.ridePeople === '3-4') ? ADDONS.ride_3_4.amount : ADDONS.ride_1_2.amount;
+  }
+  function updateRideButtons(){
+    rideYes.className = 'pcl-choice' + (state.ride === true  ? ' primary' : '');
+    rideNo .className = 'pcl-choice' + (state.ride === false ? ' primary' : '');
+    const showBadge = state.ride === true && !!state.ridePeople;
+    show(rideBadge, showBadge);
+    if (showBadge) rideBadge.textContent = '$' + rideCurrentPrice();
+  }
+
+  const seatWrap = el('div',{style:'display:none'});
+  function renderSeats(){
+    seatWrap.innerHTML = '';
+    if (!state.ride){ show(seatWrap,false); return; }
+    show(seatWrap,true);
+
+    const seg = el('div', { class:'pcl-seg', role:'radiogroup', 'aria-label':'Select number of people for the ride' });
+    const mk = (id, label, price) => el('button', {
+      class: 'opt' + (state.ridePeople === id ? ' active' : ''),
+      role: 'radio',
+      'aria-checked': String(state.ridePeople === id),
+      onclick: () => { setRide(id); renderSeats(); renderDrop(); renderTotal(); }
+    }, 
+      el('span', { class:'lbl' }, label), 
+      el('span', { class:'amt' }, `$${price}`)
+    );
+
+    seg.append(
+      mk('1-2', '1–2 people', ADDONS.ride_1_2.amount),
+      mk('3-4', '3–4 people', ADDONS.ride_3_4.amount)
+    );
+    seatWrap.append(seg);
+  }
+
+  rideQ.append(rideHeadRow, rideSub, rideBtns, seatWrap);
+
+  /* Switching from curbside → ride clears PWM autofill so the user can type a ride pickup location. */
+  function setRide(people){
+    state.ride = true;
+    state.ridePeople = people || null;    // ← no auto-pick
+
+    // reset curbside completely
+    state.curbside = null;
+    state.prefillDropPWM = false;
+    curbAnswered = false;
+
+    // clear 2nd-window details until seat is chosen
+    clearSecondWindow();
+
+    // keep extras tidy (add only when a seat is picked)
+    state.extras = state.extras.filter(x => x.id !== ADDONS.pwm_curb.id && !/^ride_pwm_/.test(x.id));
+    if (people === '1-2') state.extras.push(ADDONS.ride_1_2);
+    if (people === '3-4') state.extras.push(ADDONS.ride_3_4);
+
+    updateRideButtons();
+    updateCurbYN(); // refresh curbside buttons to “neutral”
+  }
+
+  function clearRide(){
+    state.ride = false;
+    state.ridePeople = null;
+
+    // curbside goes neutral; user must click Yes/No again
+    state.curbside = null;
+    state.prefillDropPWM = false;
+    curbAnswered = false;
+
+    // clear 2nd-window details
+    clearSecondWindow();
+
+    state.extras = state.extras.filter(x => !/^ride_pwm_/.test(x.id));
+    updateRideButtons();
+    updateCurbYN(); // makes both curb buttons unselected
+  }
+
+  // ---------- INLINE Q: CURBSIDE (active button + badge hide on "No") ----------
+  const curbQ = el('div',{class:'pcl-inlineq',style:'display:none'});
+
+  // header + price badge
+  const curbBadge = el('div',{class:'pcl-badge',id:'pcl-curb-badge'},'$'+ADDONS.pwm_curb.amount);
+  const curbSub   = el('div',{class:'sub',id:'pcl-curb-sub'},'We’ll meet you curbside at departures with your bags when it’s time to fly. Just let us know when you’ll be there and we’ll take care of the rest.');
+  curbQ.append(
+    el('div',{class:'rowhead'},
+      el('h4',{},'Would you like your Bags Delivered to You at the Portland Airport?'),
+      curbBadge
+    ),
+    curbSub
+  );
+
+  // Yes/No row
+  const curbBtns = el('div',{class:'pcl-choices'});
+  const curbYesBtn = el('button',{class:'pcl-choice'},'Yes');
+  const curbNoBtn  = el('button',{class:'pcl-choice'},'No');
+  curbBtns.append(curbYesBtn, curbNoBtn);
+  curbQ.append(curbBtns);
+
+  function updateCurbYN(){
+    curbYesBtn.className = 'pcl-choice' + (state.curbside === true  ? ' primary' : '');
+    curbNoBtn.className  = 'pcl-choice' + (state.curbside === false ? ' primary' : '');
+    show(curbBadge, state.curbside === true);
+    show(curbSub,   state.curbside !== false);
+  }
+
+  function setCurbside(on){
+    if (on){
+      state.curbside = true;
+      state.ride = false;
+      state.ridePeople = null;
+      state.prefillDropPWM = true;
+
+      // show PWM as the destination when curbside is ON
+      state.dropoffAddress = PWM_LABEL;
+      state.dropoffZip     = PWM.zip;
+      state.dropoffCanon   = PWM.address;   // canonical for PWM
+
+
+      state.extras = state.extras.filter(x => !/^ride_pwm_/.test(x.id));
+      if (!state.extras.some(x=>x.id===ADDONS.pwm_curb.id)) state.extras.push(ADDONS.pwm_curb);
+    } else {
+      state.curbside = false;
+      state.prefillDropPWM = false;
+
+      // user chose “No” → normal return; clear PWM so they can type
+      // user chose “No” → normal return; clear PWM so they can type
+      clearSecondWindow();
+      state.dropoffCanon = '';
+
+
+      state.extras = state.extras.filter(x => x.id !== ADDONS.pwm_curb.id);
+    }
+
+    // Mark question answered
+    curbAnswered = true;
+    updateCurbYN();
+  }
+
+  // wire buttons (DRY)
+  const onCurb = v => { setCurbside(v); refreshAll(); };
+  curbYesBtn.onclick = ()=> onCurb(true);
+  curbNoBtn.onclick  = ()=> onCurb(false);
+
+  // ensure initial visual state
+  updateCurbYN();
+
+  // ---------- DROP/SECOND WINDOW CARD ----------
+  let dropCard, dropAddrEl, dropZipEl, dropDateEl, dropTimeEl;
+  function buildDrop(){
+    const secTitle   = state.ride ? 'Ride pickup address' : (state.curbside ? 'Airport curbside (PWM)' : 'Baggage return address');
+    const doPlaceholder = state.curbside
+      ? PWM_DISPLAY_LABEL
+      : (state.ride
+          ? 'Ride pickup address (e.g., 12 Free St, Portland, ME)'
+          : 'Baggage return address (e.g., 2 Commercial St, Portland, ME)');
+
+    dropAddrEl = el('input',{
+    id:'pcl-do-addr', class:'pcl-inp',
+    placeholder: doPlaceholder,
+    value: state.curbside ? `${PWM_DISPLAY_LABEL} — ${PWM.address}` : (state.dropoffAddress||''),
+    autocomplete:'off', autocapitalize:'off', autocorrect:'off', spellcheck:'false', inputmode:'search'
+    });
+
+    dropAddrEl.readOnly = !!state.curbside;
+    if (!state.curbside) dropAddrEl.removeAttribute('readonly');
+
+    dropZipEl  = el('input',{type:'hidden',id:'pcl-do-zip',value:state.dropoffZip||''});
+    dropDateEl = el('input',{id:'pcl-do-date',class:'pcl-inp',type:'date',min:state.pickupDate||todayISO(),value:state.dropoffDate||state.pickupDate||todayISO()});
+    dropTimeEl = el('select',{id:'pcl-do-time',class:'pcl-inp'});
+
+    const dropSuggest = (function(){
+      if (state.curbside) return null;           // no suggestions for fixed PWM curbside
+      const wrap = el('div',{class:'pcl-suggest'});
+      const btn  = el('button',{class:'pcl-suggest-toggle',type:'button'},'Suggested spots ▾');
+      const pop  = el('div',{class:'pcl-suggest-pop'});
+      SUGGESTED_PICKS.forEach(s=>{
+        pop.append(
+          el('button',{
+            class:'pcl-chipbtn sm', type:'button',
+            onclick:()=>{
+              const label = `${s.label} — ${s.addr}`;
+              dropAddrEl.value = label;
+              dropZipEl.value  = s.zip;
+              state.dropoffAddress = label;
+              state.dropoffZip     = s.zip;
+              state.dropoffCanon   = s.addr;             // ← canonical street address
+              wrap.classList.remove('open');
+            }
+          }, s.label)
+        );
+      });
+      btn.addEventListener('click',()=>wrap.classList.toggle('open'));
+      wrap.append(btn,pop);
+      return wrap;
+    })();
+
+    const card = el('div',{class:'pcl-card'},
+      el('h3',{}, state.ride ? 'RIDE PICKUP ADDRESS' : (state.curbside ? 'PWM CURBSIDE' : 'BAGGAGE RETURN')),
+      el('div',{}, el('label',{}, secTitle), dropAddrEl, dropZipEl),
+      (state.ride ? dropSuggest : null),        // ⬅️ Suggested spots row in Ride mode
+      el('div',{class:'pcl-row-3'},
+        el('div',{}, el('label',{}, state.ride ? 'Pickup date' : (state.curbside ? 'Handoff date' : 'Return date')), dropDateEl),
+        el('div',{}, el('label',{}, state.ride ? 'Pickup time window' : (state.curbside ? 'Handoff window' : 'Return time window')), dropTimeEl)
+      )
+    );
+
+    attachAutocomplete(dropAddrEl, dropZipEl);
+    dropAddrEl.addEventListener('input',()=>{
+      const v = dropAddrEl.value.trim();
+      if (state.curbside){
+        state.dropoffAddress = `${PWM_DISPLAY_LABEL} — ${PWM.address}`;
+        state.dropoffCanon   = PWM.address;  // fixed canonical
+      } else {
+        state.dropoffAddress = v;
+        state.dropoffCanon   = v;
+      }
+    });
+    dropAddrEl.addEventListener('change',()=>{
+      const v = dropAddrEl.value.trim();
+      state.dropoffAddress = v;
+      if (!state.curbside) state.dropoffCanon = v;
+    });
+
+    dropDateEl.onchange = ()=>{
+      state.dropoffDate = dropDateEl.value;
+      fillTimes(dropTimeEl, dropDateEl.value, (dropDateEl.value === puDate.value));
+    };
+    dropTimeEl.onchange = ()=>{ state.dropoffSlot = dropTimeEl.value; state.days = daysFromSlots(state.pickupSlot, state.dropoffSlot); renderTotal(); };
+
+    // first paint
+    fillTimes(dropTimeEl, dropDateEl.value, (dropDateEl.value === puDate.value));
+
+    return card;
+  }
+
+  function enforceDropMin(){
+    if (!dropDateEl) return;
+    dropDateEl.min = puDate.value || todayISO();
+    if (dropDateEl.value < dropDateEl.min) dropDateEl.value = dropDateEl.min;
+    fillTimes(dropTimeEl, dropDateEl.value, (dropDateEl.value === puDate.value));
+  }
+
+  // ---------- TOTAL PREVIEW ----------
+  const receipt = el('div',{class:'pcl-receipt'});
+  function renderTotal(){
+    const {base, extrasAmt, passName} = calcTotals();
+    receipt.innerHTML='';
+    receipt.append(
+      el('div',{class:'row'}, el('span',{}, passName), el('span',{}, `$${base.toFixed(2)}`)),
+      ...(state.extras.length
+        ? state.extras.map(x=>el('div',{class:'row'}, el('span',{}, x.label), el('span',{}, `$${(x.amount||0).toFixed(2)}`)))
+        : [el('div',{class:'row'}, el('span',{class:'pcl-muted'}, 'No extras selected'), el('span',{}, '$0.00'))]
+      ),
+      el('div',{class:'row total'}, el('span',{}, 'Total (preview)'), el('span',{}, `$${(base + state.extras.reduce((s,x)=>s+(x.amount||0),0)).toFixed(2)}`))
+    );
+  }
+  const totalsCard = el('div',{class:'pcl-card'}, receipt);
+
+  // ---------- Inline reveal logic ----------
+  let rideAnswered = (state.ride !== null);
+  let curbAnswered = (state.curbside !== null);
+
+  // Require a *real* selected slot. If dropdown shows “Please select…” or “No times…”,
+  // our fillTimes() left state.pickupSlot = '' so this will be false.
+  function isFullAddress(s){
+    const v = (s||'').trim(); if (!v) return false;
+    // Treat canonical PWM label as full too
+    if (v.includes('Portland International Jetport') || v.includes('PWM')) return true;
+    // Heuristic: has a street number AND a comma (street + city)
+    return /\d/.test(v) && v.includes(',') && v.length >= 8;
+  }
+  function pickupReady(){
+    // Require a fullish address AND an explicit pickup time selection
+    return isFullAddress(puAddr.value) && !!state.pickupSlot;
+  }
+
+  function renderQs(){
+    // button highlight state
+    updateRideButtons();
+
+    // Show Ride question only when a valid pickup address + actual slot exist
+    show(rideQ, pickupReady());
+
+    // seat segment
+    if (state.ride){ show(seatWrap,true); renderSeats(); }
+    else           { show(seatWrap,false); }
+
+    // curbside appears only when Ride explicitly set to No AND pickup is ready
+    show(curbQ, pickupReady() && rideAnswered && state.ride === false);
+  }
+
+  function renderDrop(){
+    const shouldShow = pickupReady() && (
+      (state.ride === true  && !!state.ridePeople) ||
+      (state.ride === false && curbAnswered)
+    );
+    if (!dropCard){
+      dropCard = buildDrop();
+      c.insertBefore(dropCard, totalsCard);
+    }
+    show(dropCard, shouldShow);
+
+    if (shouldShow){
+      // rebuild the card if the mode changed (ride ↔ curbside ↔ return)
+      const prev = dropCard;
+      c.removeChild(prev);
+      dropCard = buildDrop();
+      c.insertBefore(dropCard, totalsCard);
+      enforceDropMin();
+    }
+  }
+
+  function maybeAdvanceQ(){ renderQs(); renderDrop(); }
+
+  // ---------- Wire up pickup + slots (respect priority BEFORE first fill) ----------
+  attachAutocomplete(puAddr, puZipHidden);
+  puAddr.addEventListener('input',()=>{
+    const v = puAddr.value.trim();
+    state.pickupAddress = v;
+    state.pickupCanon   = v;     // user typed a literal address
+    maybeAdvanceQ();
+  });
+
+  // Sync priority extra and render the initial list with auto-pick OFF (prompt)
+  syncPriorityExtra();                               
+  fillTimes(puTime, puDate.value, false, false)
+    .then(()=>{ state.days = daysFromSlots(state.pickupSlot, state.dropoffSlot); renderTotal(); renderQs(); renderDrop(); });
+
+  // If priority toggles: recompute lists and force manual re-pick under the new lead time
+  priChk.addEventListener('change', async ()=>{
+  // 1) reflect UI -> state.extras + state.priority
+  syncPriorityExtra();
+
+  // 2) clear current selection so we can re-pick under the new lead time
+  state.pickupSlot  = '';
+  state.dropoffSlot = '';
+
+  // 3) bypass cached slots and any in-flight requests for this date
+  clearSlotsCache(puDate.value);
+
+  // pickup list: earliest allowed (no auto-pick → prompt) — forceReload so priority applies immediately
+  await fillTimes(puTime, puDate.value, false, false, true);
+
+  // dropoff list: enforce “after pickup” only if same-day — also force reload
+  if (dropTimeEl && dropDateEl) {
+    const sameDay = (dropDateEl.value === puDate.value);
+    await fillTimes(dropTimeEl, dropDateEl.value, sameDay, true, true);
+  }
+
+  // 4) refresh totals and dependent UI
+  state.days = daysFromSlots(state.pickupSlot, state.dropoffSlot);
+  refreshAll();
+});
+
+
+  // When the DATE changes, require a manual time selection (no auto-pick)
+  puDate.onchange = ()=>{ 
+    state.pickupDate = puDate.value;
+    fillTimes(puTime, puDate.value, false, false)
+      .then(()=>{ enforceDropMin(); state.days = daysFromSlots(state.pickupSlot, state.dropoffSlot); renderTotal(); maybeAdvanceQ(); });
+  };
+
+  // When the TIME changes, update state and proceed
+  puTime.onchange = ()=>{ 
+    state.pickupSlot = puTime.value; 
+    enforceDropMin(); 
+    state.days = daysFromSlots(state.pickupSlot, state.dropoffSlot); 
+    renderTotal(); 
+    maybeAdvanceQ(); 
+  };
+
+  // ---------- Assemble ----------
+  c.append(pickCard, rideQ, curbQ, totalsCard, err);
+
+  // ---------- Actions ----------
+  const back = el('button',{class:'pcl-btn secondary',onclick:()=>go(1)},'Back');
+  const next = el('button',{class:'pcl-btn',onclick:()=>{
+    // finalize values
+    state.pickupZip  = (puZipHidden.value||'').slice(0,5);
+    state.pickupAddress = puAddr.value.trim();
+
+    if (dropCard){
+      state.dropoffAddress = state.curbside ? PWM_LABEL : (state.dropoffAddress || '').trim();
+      state.dropoffZip     = (state.curbside ? PWM.zip : (dropZipEl ? dropZipEl.value : '')).slice(0,5);
+    }
+
+    // validations
+    if(!state.pickupAddress){ err.textContent='Please enter your pickup address.'; return; }
+    if(!inService(state.pickupZip)){ err.textContent='Pickup ZIP not in service area.'; return; }
+
+    if (dropCard && !state.curbside){
+      if(!state.dropoffAddress){ err.textContent=(state.ride?'Ride pickup address':'Return address')+' is required.'; return; }
+      if(!inService(state.dropoffZip)){ err.textContent=(state.ride?'Ride pickup ZIP':'Return ZIP')+' not in service area.'; return; }
+    }
+
+    if (dropDateEl && dropTimeEl){
+      if (dropDateEl.value < puDate.value){ err.textContent='Second window must be same day or after pickup.'; return; }
+      if (dropDateEl.value===puDate.value && !isAfterPickup(state.dropoffSlot)){ err.textContent='Choose a second window later than pickup.'; return; }
+    }
+
+    err.textContent = '';
+    go(3);
+  }}, 'Continue');
+
+  c.append(el('div',{class:'pcl-actions'}, back, next));
+  return c;
+}
+
+
+  /* ====================== STEP 3 — Extras (lean & hardened) ====================== */
+function step3(){
+  const c = el('div');
+  c.append(el('h2',{class:'pcl-title'},'Travel extras (optional)'), stepBar(3));
+
+  // Compact helper for $ formatting (2dp in totals only)
+  const money = n => `$${Number(n).toFixed(2)}`;
+
+  // Short, helpful note card
+  const guarantee = el('div',{class:'pcl-contact', style:'margin-top:0'},
+    el('div',{class:'pcl-note'},
+      'If you need anything for your travel day, select it here and we’ll bring it when we deliver your bags.'
+    )
+  );
+
+  // One extra card (Add/Remove button toggles state in-place; no full rerender)
+  function card(item){
+    const added = state.extras.some(x=>x.id===item.id);
+    const btn   = el('button',{class:'pcl-choice'+(added?' primary':'' )}, added?'Remove':'Add');
+    btn.onclick = ()=>{
+      const i = state.extras.findIndex(x=>x.id===item.id);
+      if (i>-1) state.extras.splice(i,1); else state.extras.push(item);
+      // Reflect new button state immediately
+      const nowAdded = i===-1;
+      btn.textContent = nowAdded ? 'Remove' : 'Add';
+      btn.className   = 'pcl-choice' + (nowAdded ? ' primary' : '');
+      totals.render(); // keep totals in sync
+    };
+    return el('div',{class:'extra-card'},
+      el('div',{},
+        el('h4',{}, item.label),
+        item.desc ? el('p',{}, item.desc) : null,
+        item.note ? el('p',{class:'pcl-muted'}, item.note) : null
+      ),
+      el('div',{},
+        `$${(item.amount||0).toFixed(0)}`,
+        el('div',{style:'height:6px'}),
+        btn
+      )
+    );
+  }
+
+  // Essentials group
+  const essentials = el('div',{class:'pcl-box'},
+    el('div',{class:'pcl-section-title'},'Travel Essentials'),
+    el('div',{class:'extras-grid'}, ...SHOP.essentials.map(card))
+  );
+
+  // Convenience group
+  const convenience = el('div',{class:'pcl-box'},
+    el('div',{class:'pcl-section-title'},'Convenience'),
+    el('div',{class:'extras-grid'}, ...SHOP.convenience.map(card))
+  );
+
+  // === Totals (preview) — kept identical output, slightly hardened ===
+  const totals = (function(){
+    const box = el('div',{class:'pcl-receipt'});
+    function render(){
+      const t = calcTotals(); // { base, extrasAmt, passName }
+      const baseLabel = `${t.passName} , ${state.bags} bag${state.bags>1?'s':''} , ${state.days} day${state.days>1?'s':''}`;
+      box.innerHTML='';
+      box.append(
+        el('div',{class:'row'}, el('span',{}, baseLabel), el('span',{}, money(t.base))),
+        ...(state.extras.length
+          ? state.extras.map(x=>el('div',{class:'row'}, el('span',{}, x.label), el('span',{}, money(x.amount||0))))
+          : [el('div',{class:'row'}, el('span',{class:'pcl-muted'}, 'No extras selected'), el('span',{}, '$0.00'))]
+        ),
+        el('div',{class:'row total'}, el('span',{}, 'Total (preview)'), el('span',{}, money(t.base + t.extrasAmt)))
+      );
+    }
+    render();
+    return { node: el('div',{class:'pcl-card'}, box), render };
+  })();
+
+  // Assemble
+  c.append(guarantee, essentials, convenience, totals.node);
+
+  // Navigation
+  const backBtn = el('button', { class:'pcl-btn secondary', onclick:()=>go(2) }, 'Back');
+  const nextBtn = el('button', { class:'pcl-btn', onclick:()=>go(4) }, 'Next');
+  c.append(el('div', { class:'pcl-actions' }, backBtn, nextBtn));
+
+// Begin Stripe prewarm as soon as Extras mounts (cold-start safe)
+prewarmStripe('step3_show').catch(()=>{});
+
+  return c;
+}
+
+
+/* ====================== STEP 4 — Review & Reserve (lean & commented) ====================== */
+
+/* ---- Warm cache for Stripe checkout URL (10 min TTL) ---- */
+let __checkoutWarm = { url:'', at:0 };
+let __checkoutInflight = null;                  // de-dupe concurrent prewarms
+const CHECKOUT_TTL_MS = 10 * 60 * 1000;
+
+function checkoutFresh(){
+  return __checkoutWarm.url && ((Date.now() - __checkoutWarm.at) < CHECKOUT_TTL_MS);
+}
+
+async function ensureBooked(opts={}){
+  if (state.booking_id) return state.booking_id;
+  const payload = buildBookingPayload();
+  if (!payload.customer_name) return '';        // user not ready yet
+  const b = await proxyPost('book', { booking: payload }, {
+    timeoutMs: opts.timeoutMs ?? 35000,         // cold-start safe
+    retries: opts.retries ?? 1, backoffMs: 800
+  });
+  if (b && b.ok && b.booking_id){
+    state.booking_id = b.booking_id;
+    sessionStorage.setItem('pcl_booking_id_mirror', state.booking_id); // mirror (see patch 3)
+    persistState();
+    return state.booking_id;
+  }
+  throw new Error('book_failed');
+}
+
+async function prewarmStripe(reason=''){
+  if (checkoutFresh()) return __checkoutWarm;
+  if (__checkoutInflight) return __checkoutInflight;
+
+  const t0 = performance.now();
+  if (DEBUG) console.log('[PCL] PREWARM start', { reason });
+
+  __checkoutInflight = (async ()=>{
+    try{
+      // Warm the API/lambda only — no side-effects (no Slack, no session/url)
+      await proxyPost('config', { __prewarm: 1 }, {
+        timeoutMs: 15000, retries: 0
+      });
+
+      // Mark warmed so we don’t keep re-warming; no URL is created here
+      __checkoutWarm = { at: Date.now() };
+
+      if (DEBUG) console.log('[PCL] PREWARM ok (config)', { ms: Math.round(performance.now()-t0) });
+      return __checkoutWarm;
+    } catch (e){
+      if (DEBUG) console.warn('[PCL] PREWARM fail', String(e), { ms: Math.round(performance.now()-t0) });
+      return __checkoutWarm;
+    } finally {
+      __checkoutInflight = null;
+    }
+  })();
+
+  return __checkoutInflight;
+}
+
+
+
+/* Build the booking payload (factored out so we can use it on step-4 mount) */
+function buildBookingPayload(){
+  const { name, email, bags, days, pickupAddress, pickupZip, pickupSlot,
+          dropoffAddress, dropoffZip, dropoffSlot, noteToDriver } = state;
+
+  const baseLabelForStripe = `${passNameForBags(bags)} — ${days} ${days === 1 ? 'Day' : 'Days'}`;
+  const addonsNormalized = (Array.isArray(state.extras) ? state.extras : [])
+    .map(x => ({ id:x.id, label:String(x.label||''), amount:Number(x.amount)||0 }));
+
+  return {
+    customer_name: (name||'').trim(),
+    phone: fullPhone(),
+    email: (email||'').trim(),
+    bags: Number(bags)||1,
+    days: Number(days)||1,
+    pickup_addr: `${state.pickupCanon || pickupAddress || ''} ${(pickupZip||'').slice(0,5)}`.trim(),
+    pickup_time_iso: pickupSlot || '',
+    dropoff_addr: `${state.dropoffCanon || dropoffAddress || ''} ${(dropoffZip||'').slice(0,5)}`.trim(),
+    dropoff_time_iso: dropoffSlot || '',
+    addons: addonsNormalized,
+    base_label: baseLabelForStripe,
+    notes: noteToDriver ? String(noteToDriver).slice(0,500) : '',
+    terms_accepted: true,
+    copy_version: '2025-08-18'
+  };
+}
+
+/* Ensure a PENDING booking exists, then prewarm checkout URL (called when step-4 shows) */
+/* Ensure a PENDING booking exists, then prewarm checkout URL (called when step-4 shows) */
+async function onReviewStepShown(){
+  try { await prewarmStripe('step4_show'); } catch(_) {}
+}
+
+
+
+async function step4(){
+  const c = el('div');
+  // --- Top header + quick edit pills (kept look; no CSS dependency changes)
+  const reviewTitle = el('h2', {
+    style: 'margin:0 0 10px;font-size:42px;font-weight:900;letter-spacing:.3px;color:#222;'
+  }, 'BOOKING CONFIRMATION REVIEW');
+
+  const pill = (label, goTo)=> el('button', {
+    type:'button',
+    onclick:()=>go(goTo),
+    style: 'padding:12px 18px;border-radius:999px;background:#fff;border:1px solid #e6e9ee;box-shadow:0 1px 0 rgba(0,0,0,.04);font-weight:700;cursor:pointer;'
+  }, label);
+
+  const pillRow = el('div', { style:'display:flex;flex-wrap:wrap;gap:18px;margin:0 0 12px' },
+    pill('1. Edit details', 1),
+    pill('2. Edit schedule', 2),
+    pill('3. Edit extras',   3)
+  );
+
+  const infoBanner = el('div', {
+    style: 'background:#eef6ff;border:1px solid #cfe2ff;color:#1f2937;border-radius:14px;padding:14px 16px;margin:0 0 14px;'
+  }, 'Please review and confirm all information below before clicking reserve.');
+
+  c.append(reviewTitle, pillRow, infoBanner);
+
+  // --- Helpers to keep markup terse
+  const labelCaps = s => el('div', { style:'font-weight:900;color:#0b2e66;letter-spacing:.4px;margin-bottom:6px' }, s);
+  const smallNote = s => el('div', { class:'pcl-sub', style:'margin-top:8px;font-size:12px;color:#6b7280' }, s);
+
+  const twoColRow = (leftTitle, leftVal, rightTitle, rightVal) => el(
+    'div', { style:'display:grid;grid-template-columns:1.4fr .8fr;gap:12px' },
+    el('div', { style:'background:#fff;border:1px solid #e6e9ee;border-radius:12px;padding:12px' },
+      labelCaps(leftTitle), el('div', {}, leftVal || '—')
+    ),
+    el('div', { style:'background:#fff;border:1px solid #e6e9ee;border-radius:12px;padding:12px' },
+      labelCaps(rightTitle), el('div', {}, rightVal || '—')
+    )
+  );
+
+  // --- Left column cards
+  // Pickup summary
+  const puAddrTxt = state.pickupAddress || '';
+  const puTimeTxt = state.pickupSlot ? fmtRange(state.pickupSlot) : '';
+  const pickCard = el('div', { class:'pcl-card' },
+    el('h3', { style:'margin:0 0 10px;font-size:22px;font-weight:900;letter-spacing:.2px;color:#0b2e66' }, 'BAGGAGE PICKUP'),
+    twoColRow('PICKUP ADDRESS', puAddrTxt, 'PICKUP WINDOW', puTimeTxt)
+  );
+
+  // Second window summary (Ride / Curbside / Delivery)
+  const isRide = !!state.ride;
+  const isCurb = !!state.curbside;
+
+  const secTitle = isRide ? 'RIDE PICKUP'
+                : isCurb ? 'CURBSIDE DELIVERY'
+                         : 'BAGGAGE DELIVERY';
+
+  const leftLabel  = isRide ? 'RIDE PICKUP ADDRESS'
+                  : isCurb ? 'CURBSIDE LOCATION'
+                           : 'RETURN ADDRESS';
+
+  const rightLabel = isRide ? 'RIDE WINDOW'
+                  : isCurb ? 'HANDOFF WINDOW'
+                           : 'RETURN WINDOW';
+
+  const doAddrTxt = state.dropoffAddress || (isCurb ? 'Portland International Jetport (PWM) — Departures' : '');
+  const doTimeTxt = state.dropoffSlot ? fmtRange(state.dropoffSlot) : '';
+
+  const secondCard = el('div', { class:'pcl-card' },
+    el('h3', { style:'margin:0 0 10px;font-size:22px;font-weight:900;letter-spacing:.2px;color:#0b2e66' }, secTitle),
+    twoColRow(leftLabel, doAddrTxt, rightLabel, doTimeTxt),
+    smallNote('All times shown are Portland, Maine local time.')
+  );
+
+  // Customer info
+  const custCard = el('div', { class:'pcl-card' },
+    el('h3', { style:'margin:0 0 10px;font-size:22px;font-weight:900;letter-spacing:.2px;color:#0b2e66' }, 'CUSTOMER INFORMATION'),
+    (()=> {
+      const box = el('div', { style:'background:#fff;border:1px solid #e6e9ee;border-radius:12px;padding:12px;display:grid;row-gap:10px' });
+      box.append(
+        el('div', {}, el('div',{style:'font-weight:800;color:#6b7280;font-size:12px;letter-spacing:.4px'},'NAME'),  el('div',{}, state.name || '—')),
+        el('div', {}, el('div',{style:'font-weight:800;color:#6b7280;font-size:12px;letter-spacing:.4px'},'EMAIL'), el('div',{}, state.email || '—')),
+        el('div', {}, el('div',{style:'font-weight:800;color:#6b7280;font-size:12px;letter-spacing:.4px'},'PHONE'), el('div',{}, `${state.cc||''} ${state.phoneLocal||''}`.trim() || '—'))
+      );
+      return box;
+    })()
+  );
+
+  // --- Total (right column)
+  const money = n => `$${Number(n).toFixed(2)}`;
+  const pricing   = priceForBagsAndDays(state.bags, state.days);
+  const base      = pricing.total;
+  state.basePrice = base;
+  const extrasAmt = state.extras.reduce((s,x)=>s+(x.amount||0),0);
+  const total     = base + extrasAmt;
+  state.price     = total;
+  const passName  = passNameForBags(state.bags);
+
+  const totalCard = (()=>{
+    const row = (label, price, isTotal)=> el('div', {
+      class:'row',
+      style:`display:flex;align-items:flex-start;gap:12px;${isTotal?'border-top:1px solid #e5e7eb;padding-top:8px;font-weight:800;':'margin:6px 0;'}`
+    },
+      el('span', { style:'flex:1;min-width:0' }, label),
+      el('span', { style:'min-width:max-content;text-align:right' }, money(price))
+    );
+
+    const box = el('div', { class:'pcl-receipt' });
+
+    // Base row with sublines
+    box.append(
+      el('div', { class:'row', style:'display:flex;justify-content:space-between;gap:12px' },
+        el('span', {}, passName),
+        el('span', { style:'min-width:max-content;text-align:right' }, money(base))
+      ),
+      el('div', { style:'margin:4px 0 8px 14px;color:#6b7280;font-size:12px;line-height:1.35' },
+        el('div', {}, `• ${state.bags} bag${state.bags>1?'s':''}`),
+        el('div', {}, `• ${state.days} day${state.days>1?'s':''}`)
+      )
+    );
+
+    // Extras or $0
+    if (state.extras.length){
+      state.extras.forEach(x=> box.append(row(x.label, x.amount || 0, false)));
+    } else {
+      box.append(
+        el('div', { class:'row', style:'display:flex;justify-content:space-between;gap:12px' },
+          el('span', { class:'pcl-muted' }, 'No extras selected'),
+          el('span', {}, '$0.00')
+        )
+      );
+    }
+
+    box.append(
+      el('div', { class:'row total', style:'display:flex;justify-content:space-between;gap:12px;border-top:1px solid #e5e7eb;padding-top:8px;font-weight:800' },
+        el('span', {}, 'Total today'),
+        el('span', {}, money(total))
+      )
+    );
+
+    return el('div', { class:'pcl-card' },
+      el('h3', { style:'margin:0 0 10px;font-size:22px;font-weight:900;letter-spacing:.2px;color:#0b2e66' }, 'TOTAL'),
+      box
+    );
+  })();
+
+  // --- Layout (grid managed by existing CSS class)
+  const grid   = el('div', { class:'pcl-review-grid' });
+  const leftCol= el('div', {}, pickCard, secondCard, custCard);
+  grid.append(leftCol, totalCard);
+  c.append(grid);
+
+  // --- Note to driver (persist on input)
+  const noteCard = el('div', { class:'pcl-card' },
+    el('h3', { style:'margin:0 0 10px;font-size:22px;font-weight:900;letter-spacing:.2px;color:#0b2e66' }, 'NOTE TO DRIVER'),
+    (()=>{
+      const t = el('textarea', { class:'pcl-inp', placeholder:'Gate code, directions, special handling, etc.' });
+      t.value = state.noteToDriver || '';
+      t.addEventListener('input', ()=>{ state.noteToDriver = t.value.slice(0,500); persistState(); });
+      return t;
+    })()
+  );
+  c.append(noteCard);
+
+  // --- Terms + Pay (kept interactions; slightly tidied)
+  const termsWrap = el('div', { style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:18px 0 6px' });
+  const termsChk  = el('input', { type:'checkbox' });
+  termsChk.checked = state.terms === true;
+
+  const chkLabel  = el('label', { style:'display:inline-flex;align-items:center;gap:10px;margin:0;cursor:pointer' },
+    termsChk, el('span', {}, 'I agree to the')
+  );
+  const termsLink = el('a', {
+    href: 'https://www.portcityluggage.com/termsandconditions', target: '_blank', rel: 'noopener', style: 'font-weight:700'
+  }, 'Terms & Conditions');
+
+  termsWrap.append(chkLabel, termsLink);
+
+  const payBtn = el('button', {
+    id: 'pcl-pay', type: 'button', class: 'pcl-btn',
+    style: [
+      'position:relative;overflow:hidden;display:inline-flex;align-items:center;justify-content:center',
+      'padding:16px 28px;border-radius:14px;border:0;font-size:18px;font-weight:900;letter-spacing:.3px;text-transform:uppercase',
+      'color:#fff;background:linear-gradient(180deg,#17407f,#0b2e66)',
+      'box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 12px 24px rgba(11,46,102,.25),0 6px 14px rgba(11,46,102,.18)',
+      'transition:transform .08s ease, box-shadow .15s ease, opacity .15s ease'
+    ].join(';')
+  }, 'RESERVE NOW');
+
+  payBtn.addEventListener('mouseenter', ()=>{ if (!checkoutFresh()) prewarmStripe('hover').catch(()=>{}); });
+
+  payBtn.disabled = !termsChk.checked;
+
+  // Gloss & hover
+  payBtn.addEventListener('mouseenter', () => {
+    payBtn.style.boxShadow = 'inset 0 1px 0 rgba(255,255,255,.45),0 16px 30px rgba(11,46,102,.28),0 8px 18px rgba(11,46,102,.2)';
+  });
+  payBtn.addEventListener('mouseleave', () => {
+    payBtn.style.boxShadow = 'inset 0 1px 0 rgba(255,255,255,.35),0 12px 24px rgba(11,46,102,.25),0 6px 14px rgba(11,46,102,.18)';
+  });
+  payBtn.addEventListener('mousedown', () => { payBtn.style.transform = 'translateY(1px)'; });
+  payBtn.addEventListener('mouseup',   () => { payBtn.style.transform = 'translateY(0)';   });
+
+  // Shine sweep (unchanged visually; scoped cleanup)
+  (function addShine(){
+    const shine = document.createElement('span');
+    shine.style.cssText = [
+      'position:absolute;left:-140%;top:0;height:100%;width:120%',
+      'background:linear-gradient(110deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.35) 45%,rgba(255,255,255,0) 90%)',
+      'transform:skewX(-12deg);pointer-events:none'
+    ].join(';');
+    payBtn.appendChild(shine);
+
+    const sweep = ()=>{
+      shine.style.transition = 'none';
+      shine.style.left = '-140%';
+      void shine.offsetWidth;
+      shine.style.transition = 'left .9s ease-out';
+      shine.style.left = '120%';
+    };
+
+    sweep();
+    const tick = setInterval(()=>{ if (document.visibilityState === 'visible') sweep(); }, 5000);
+    payBtn.addEventListener('mouseenter', sweep);
+    payBtn.addEventListener('touchstart', sweep, { passive:true });
+
+    const mo = new MutationObserver(() => {
+      if (!document.body.contains(payBtn)) { clearInterval(tick); mo.disconnect(); }
+    });
+    mo.observe(document.body, { childList:true, subtree:true });
+  })();
+
+  termsChk.addEventListener('change', e => {
+    state.terms = !!e.target.checked;
+    payBtn.disabled = !state.terms;
+    persistState();
+  });
+
+  const payMsg = el('div', { id:'pcl-pamsg', class:'pcl-help', style:'text-align:center;margin-top:8px;display:none;' }, 'Redirecting to secure checkout…');
+  payBtn.addEventListener('click', submitAndPay);
+
+  const ctaRow = el('div', { class:'pcl-actions', style:'display:flex;align-items:center;gap:12px;margin:6px 0 44px' }, payBtn, payMsg);
+    c.append(termsWrap, ctaRow);
+
+    // Begin background booking (if needed) and checkout prewarm now
+    onReviewStepShown();
+
+  return c;
+}
+
+
+/* ====================== SUBMIT + STRIPE ====================== */
+async function submitAndPay(e){
+  if (e && typeof e.preventDefault === 'function') e.preventDefault();
+  if (state.terms !== true){ showToast('Please accept the Terms & Conditions.'); return; }
+
+  function setBusy(on){
+    const btn = document.getElementById('pcl-pay');
+    const msg = document.getElementById('pcl-pamsg');
+    if (btn){ btn.disabled = !!on; btn.classList.toggle('loading', !!on); }
+    if (msg){ msg.style.display = on ? 'block' : 'none'; }
+  }
+  setBusy(true);
+
+// If a prewarm is already running, piggy-back instead of starting a new cold one
+if (!checkoutFresh() && __checkoutInflight){
+  try{
+    const warm = await __checkoutInflight;
+    if (warm && warm.url){
+      state.step = 6; persistState();
+      sessionStorage.setItem('pcl_pending_checkout','1');
+      window.location = warm.url;
+      return;
+    }
+  }catch(_){}
+}
+
+
+  try{
+    // Ensure booking exists (if user hit reserve immediately on step-4)
+    if (!state.booking_id){
+      const payload = buildBookingPayload();
+      if (!payload.customer_name){
+        showToast('Please enter your name on Step 1.');
+        setBusy(false);
+        return;
+      }
+      const bookingRes = await proxyPost('book', { booking: payload });
+      if (!bookingRes || !bookingRes.ok) throw new Error((bookingRes && bookingRes.error) || 'Could not book');
+      state.booking_id = bookingRes.booking_id;
+      sessionStorage.setItem('pcl_booking_id_mirror', state.booking_id);
+      persistState();
+
+    }
+
+    // Instant handoff if we have a fresh prewarmed URL
+    const fresh = __checkoutWarm.url && ((Date.now() - __checkoutWarm.at) < CHECKOUT_TTL_MS);
+    if (fresh){
+      state.step = 6; persistState();
+      sessionStorage.setItem('pcl_pending_checkout','1');
+      window.location = __checkoutWarm.url;
+      return;
+    }
+
+    // Fallback: request/Reuse checkout now (server will reuse session id if present)
+    const checkoutRes = await proxyPost('checkout', { booking_id: state.booking_id }, { timeoutMs: 30000, retries: 1, backoffMs: 900 });
+    if (!checkoutRes || !checkoutRes.ok || !checkoutRes.url) throw new Error((checkoutRes && checkoutRes.error) || 'Payment error');
+
+    state.step = 6; persistState();
+    sessionStorage.setItem('pcl_pending_checkout','1');
+    window.location = checkoutRes.url;
+  } catch (err){
+    showToast('Sorry—there was a problem starting checkout: ' + String(err), { duration:7000, variant:'warn' });
+    setBusy(false);
+  }
+}
+
+
+/* ====================== ROUTER ====================== */
+function go(n){
+  const target = Math.min(4, Math.max(1, Number(n)||1));
+  state.step = target;
+  state.maxStep = Math.max(state.maxStep||1, target);
+
+  $app.innerHTML = '';
+  const views = {1:step1, 2:step2, 3:step3, 4:step4};
+  const viewFn = views[target];
+
+  function render(node){
+    $app.append(node||el('div'));
+    persistState();
+    scrollToAppTop();
+  }
+
+  try{
+    const v = viewFn && viewFn();
+    (v && typeof v.then === 'function')
+      ? v.then(render).catch(e => render(el('div',{class:'pcl-err'}, String(e))))
+      : render(v);
+  }catch(e){
+    render(el('div',{class:'pcl-err'}, 'Something went wrong. Please reload.'));
+    console.error(e);
+  }
+}
+
+/* ========== STEP 6: Processing card after Stripe ========== */
+function renderProcessing(bid){
+  $app.innerHTML = '';
+  const box = el('div',{class:'pcl-box', style:'background:#f6fbff;border-color:#d5e9ff'},
+    el('h3', { style:'margin:0 0 6px;font-size:26px;font-weight:900;color:#1f2a44;letter-spacing:.2px' }, 'Please sit tight — we’re checking your order.'),
+    el('div', { class:'pcl-sub', style:'font-size:14px' }, 'This usually takes just a moment. Thanks for your patience.'),
+    el('div', { style:'margin-top:10px;font-size:12px;color:#6b7280' }, bid ? `Booking reference: ${bid}` : '')
+  );
+  const spin = document.createElement('div');
+  spin.style.cssText = 'margin-top:10px;width:22px;height:22px;border-radius:50%;border:3px solid rgba(31,42,68,.15);border-right-color:#1f2a44;animation:spin .8s linear infinite';
+  box.append(spin);
+  $app.append(box);
+}
+
+/* ========== STEP 6: Confirmation with mini maps ========== */
+async function renderConfirmed(bid, summary){
+  const {
+    pickupAddress, pickupCanon, pickupZip, pickupSlot,
+    dropoffAddress, dropoffCanon, dropoffZip, dropoffSlot,
+    curbside, ride
+  } = summary || {};
+
+
+  function boldRow(title, value){
+    return el('div',{}, el('div',{style:'font-weight:900;color:#1f2a44'}, title), el('div',{}, value||''));
+  }
+
+  // Resolve coordinates for static maps
+  let puPoint = null, doPoint = null;
+
+  if (pickupAddress){
+    const q = `${(pickupCanon || pickupAddress)} ${pickupZip||''}`.trim();
+    puPoint = await geocodeFirst(q);
+    }
+  if (curbside){
+    doPoint = PWM_DEPARTURES; // fixed curb
+  } 
+    else if (dropoffAddress){
+    const q = `${(dropoffCanon || dropoffAddress)} ${dropoffZip||''}`.trim();
+    doPoint = await geocodeFirst(q);
+  }
+
+  const card = el('div',{class:'pcl-box', style:'background:#eaf8f3;border-color:#c9f0e3'},
+    el('h2',{style:'margin:0 0 8px;font-size:34px;font-weight:900;color:#1f2a44'}, 'ALL SET! YOUR WINDOW IS RESERVED.'),
+    el('div',{style:'margin:0 0 14px;font-size:16px;color:#374151'}, `Booking ${bid} is confirmed and paid. We’ve texted your details.`),
+
+    // PICKUP
+    el('div',{style:'background:#fff;border:1px solid #e6e9ee;border-radius:12px;padding:12px;margin:8px 0'},
+      boldRow('PICKUP TIME', fmtRange(pickupSlot)),
+      boldRow('PICKUP LOCATION', pickupAddress || ''),
+      puPoint ? el('img',{alt:'Pickup map', style:'width:100%;border-radius:10px;margin-top:8px', src: staticMapURL(puPoint.lng, puPoint.lat, 760, 240, 14)}) : null
+    ),
+
+    // DROP-OFF / CURBSIDE / RIDE-PICKUP
+    el('div',{style:'background:#fff;border:1px solid #e6e9ee;border-radius:12px;padding:12px;margin:8px 0'},
+      boldRow(curbside ? 'CURBSIDE HANDOFF TIME' : (ride ? 'RIDE PICKUP TIME' : 'DELIVERY WINDOW'), fmtRange(dropoffSlot)),
+      boldRow(curbside ? 'CURBSIDE LOCATION' : (ride ? 'RIDE PICKUP LOCATION' : 'DELIVERY ADDRESS'),
+              curbside ? 'Portland International Jetport (PWM) — Departures' : (dropoffAddress || '')),
+      doPoint ? el('img',{alt:'Drop-off map', style:'width:100%;border-radius:10px;margin-top:8px', src: staticMapURL(doPoint.lng, doPoint.lat, 760, 240, 14)}) : null
+    ),
+
+    el('div',{class:'pcl-sub',style:'margin-top:10px;font-size:14px;color:#374151'},
+      'Need to change ',
+      (curbside ? 'handoff' : (ride ? 'ride pickup' : 'delivery')),
+      ' time or location? Call ',
+      el('a',{href:'tel:+12077478336'},'207 747 8336'),
+      ' at least 1 hour before the ',
+      (curbside ? 'handoff' : (ride ? 'ride pickup' : 'delivery')),
+      ' window.'
+    ),
+    el('p',{}, el('a',{href:'/'},'Back to site'))
+  );
+
+  $app.innerHTML = '';
+  $app.append(card);
+}
+
+
+/* ====================== STRIPE RETURN HANDLER ====================== */
+(function boot(){
+  const q = new URLSearchParams(location.search);
+  const paid     = q.get('paid') === '1';
+  const bid      = q.get('bid');
+  const sid      = q.get('session_id');
+  const canceled = q.get('cancel') === '1';
+
+  function softBanner(text, bg, border){
+    const note = document.createElement('div');
+    note.className = 'pcl-box';
+    note.style.background = bg;
+    note.style.borderColor = border;
+    note.innerHTML = `<b>${text}</b> You can pick up where you left off below.`;
+    $app.prepend(note);
+  }
+
+  if (paid && bid && sid){
+    restoreState();
+    const summary = {
+      pickupAddress: state.pickupAddress, pickupCanon: state.pickupCanon, pickupZip: state.pickupZip, pickupSlot: state.pickupSlot,
+      dropoffAddress: state.dropoffAddress, dropoffCanon: state.dropoffCanon, dropoffZip: state.dropoffZip, dropoffSlot: state.dropoffSlot,
+      curbside: !!state.curbside, ride: !!state.ride, ridePeople: state.ridePeople
+    };
+
+
+    renderProcessing(bid);
+
+    proxyPost('confirm', { booking_id: bid, session_id: sid })
+      .then(async ()=>{ await renderConfirmed(bid, summary); clearStoredState(); })
+      .catch(()=>{ clearStoredState(); go(1); });
+    return;                     // ← CRUCIAL: prevents fall-through to go(1)
+  }
+
+  if (canceled){
+    sessionStorage.removeItem('pcl_pending_checkout');
+    const restored = restoreState();
+    go(restored || 4);
+    softBanner('Checkout canceled.', '#fff8f6', '#fcd7cd');
+    return;                     // ← also important
+  }
+
+  const hadPending   = sessionStorage.getItem('pcl_pending_checkout') === '1';
+  const restoredStep = restoreState();
+
+  if (hadPending && restoredStep){
+    sessionStorage.removeItem('pcl_pending_checkout');
+    go(restoredStep || 6);
+    return;
+  }
+
+  if (restoredStep){ go(restoredStep); } else { state.terms = false; go(1); }
+})();
+})(); 
+</script>
