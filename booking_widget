@@ -53,6 +53,10 @@
 }
 @media (max-width:720px){ .pcl-row-tight{ grid-template-columns:1fr; } }
 
+/* 2-col helper used for date/time pairs */
+.pcl-row-3{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+@media (max-width:720px){ .pcl-row-3{ grid-template-columns:1fr; } }
+
 .pcl-grid{
   display:grid; grid-template-columns:1fr 1fr; gap:14px;
 }
@@ -620,22 +624,7 @@ select.pcl-inp option[disabled][value=""]{ color:#667; } /* placeholder for sele
 .pcl-err{ color:var(--err); text-align:center; margin:10px 0 0; }
 .pcl-err.hidden{ display:none; }
 
-#pcl-toast {
-  position: fixed;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: #fff;
-  border: 1px solid var(--err);
-  color: var(--err);
-  padding: 12px 16px;
-  border-radius: 8px;
-  box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-  z-index: 9999;
-  display: none;
-  font-size: 15px;
-  max-width: 90%;
-}
+/* Inline #pcl-toast base removed in favor of dynamic CSS injected by showToast() */
 
 
 /* ==========================================================================
@@ -661,7 +650,6 @@ select.pcl-inp option[disabled][value=""]{ color:#667; } /* placeholder for sele
 (function(){
   /* ====================== CORE CONFIG ====================== */
   const PROXY_URL = "https://pcl-proxy-githubdeploy.netlify.app/api/proxy";
-  const LOC_TOKEN  = "pk.b6b64f102fc16b6d7d01d45636c24681"; // retained (may be used elsewhere)
   const SERVICE_ZIPS = ["04101","04102"];
 
   const SLOT_MIN   = 15;
@@ -691,7 +679,7 @@ select.pcl-inp option[disabled][value=""]{ color:#667; } /* placeholder for sele
   ];
 
   /* ====================== MAPBOX AUTOCOMPLETE ====================== */
-  const MAPBOX_TOKEN = 'pk.eyJ1IjoicG9ydGNpdHlsdWdnYWdlIiwiYSI6ImNtZWM5d3NnNjFjajMya29mdzczajhmd3cifQ.eQ9BDd2F1-9wHOn_syMSkg';
+  const MAPBOX_TOKEN = (typeof window !== 'undefined' && window.PCL_MAPBOX_TOKEN) ? window.PCL_MAPBOX_TOKEN : 'pk.eyJ1IjoicG9ydGNpdHlsdWdnYWdlIiwiYSI6ImNtZWM5d3NnNjFjajMya29mdzczajhmd3cifQ.eQ9BDd2F1-9wHOn_syMSkg';
 const MAPBOX_PROX  = [-70.255, 43.659]; // Portland, ME (lng, lat)
 
 // PWM Departures curb (exact)
@@ -2386,8 +2374,20 @@ function step2(){
     // validations
     if(!state.pickupAddress){ err.textContent='Please enter your pickup address.'; return; }
     if(!inService(state.pickupZip)){ err.textContent='Pickup ZIP not in service area.'; return; }
+    if(!state.pickupSlot){ err.textContent='Please select a pickup time.'; return; }
 
-    if (dropCard && !state.curbside){
+    // Require a second-window decision before proceeding
+    // If ride selected, seats must be chosen
+    if (state.ride === true && !state.ridePeople){
+      err.textContent = 'Please choose number of people for the ride.'; return;
+    }
+    // If ride explicitly not selected, user must answer curbside Yes/No
+    if (state.ride === false && !curbAnswered){
+      err.textContent = 'Please choose whether you want airport curbside drop-off.'; return;
+    }
+
+    // If not curbside and drop card is present, validate address/zip and time
+    if (!state.curbside && dropCard){
       if(!state.dropoffAddress){ err.textContent=(state.ride?'Ride pickup address':'Return address')+' is required.'; return; }
       if(!inService(state.dropoffZip)){ err.textContent=(state.ride?'Ride pickup ZIP':'Return ZIP')+' not in service area.'; return; }
     }
@@ -2395,6 +2395,7 @@ function step2(){
     if (dropDateEl && dropTimeEl){
       if (dropDateEl.value < puDate.value){ err.textContent='Second window must be same day or after pickup.'; return; }
       if (dropDateEl.value===puDate.value && !isAfterPickup(state.dropoffSlot)){ err.textContent='Choose a second window later than pickup.'; return; }
+      if (!state.curbside && !state.dropoffSlot){ err.textContent = (state.ride ? 'Please select a ride pickup time.' : 'Please select a return time.'); return; }
     }
 
     err.textContent = '';
@@ -2577,7 +2578,7 @@ function buildBookingPayload(){
     addons: addonsNormalized,
     base_label: baseLabelForStripe,
     notes: noteToDriver ? String(noteToDriver).slice(0,500) : '',
-    terms_accepted: true,
+    terms_accepted: !!state.terms,
     copy_version: '2025-08-18'
   };
 }
@@ -2853,17 +2854,9 @@ async function submitAndPay(e){
   }
   setBusy(true);
 
-// If a prewarm is already running, piggy-back instead of starting a new cold one
+// If a prewarm is already running, piggy-back (no redirect expected here)
 if (!checkoutFresh() && __checkoutInflight){
-  try{
-    const warm = await __checkoutInflight;
-    if (warm && warm.url){
-      state.step = 6; persistState();
-      sessionStorage.setItem('pcl_pending_checkout','1');
-      window.location = warm.url;
-      return;
-    }
-  }catch(_){}
+  try{ await __checkoutInflight; }catch(_){ /* ignore prewarm error */ }
 }
 
 
