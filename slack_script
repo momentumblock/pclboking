@@ -1,0 +1,1414 @@
+/** ======================================================================
+ * Port City Luggage — Slack Automations
+ * v2.0  (threads, reminders, TTL & SLA, capacity, morning brief,
+ *        chain-of-custody photos to Drive, /tag & /done, tag form)
+ *
+ * Receives:
+ *   • From Booking backend (internal webhooks):
+ *       POST JSON {type:'booking_created'|'booking_paid', booking_id, secret}
+ *   • From Slack (events + slash commands):
+ *       - message.channels (photos in booking threads)
+ *       - /tag   (capture tag numbers)
+ *       - /done  (mark job closed)  [alias: /complete]
+ *   • From browser (tag form GET/POST)
+ * ====================================================================== */
+
+const SP = PropertiesService.getScriptProperties();
+
+const CFG = {
+  // Sheet
+  TZ:                SP.getProperty('TZ') || 'America/New_York',
+  SHEET_ID:          SP.getProperty('SHEET_ID') || '',
+  SHEET_NAME:        SP.getProperty('SHEET_NAME') || 'PCL_Bookings',
+  SLOT_MINUTES:      Number(SP.getProperty('SLOT_MINUTES') || 15),
+  PENDING_TTL_MIN:   Number(SP.getProperty('PENDING_TTL_MIN') || 20),
+
+  // Slack Channels (IDs, not names)
+  CH_OPS_LIVE:       (SP.getProperty('SLACK_CH_OPS_LIVE')||'').trim(),
+  CH_ALERTS:         (SP.getProperty('SLACK_CH_ALERTS')||'').trim(),
+  CH_CAPACITY:       (SP.getProperty('SLACK_CH_CAPACITY')||'').trim(),
+  CH_VIP:            (SP.getProperty('SLACK_CH_VIP')||'').trim(), // optional
+
+  // Slack auth
+  SLACK_TOKEN:        (SP.getProperty('SLACK_BOT_TOKEN')||'').trim(),         // xoxb-...
+  SLACK_SIGNING:      (SP.getProperty('SLACK_SIGNING_SECRET')||'').trim(),
+  SLACK_VERIFY_TOKEN: (SP.getProperty('SLACK_VERIFICATION_TOKEN')||'').trim(), // optional extra guard
+
+  // Internal handshake with Booking
+  INBOUND_SECRET:    (SP.getProperty('INBOUND_SECRET')||'').trim(),
+
+  // Ops
+  CAPACITY_PER_SLOT: Number(SP.getProperty('CAPACITY_PER_SLOT') || 3),
+  CAPACITY_WARN_AT:  Number(SP.getProperty('CAPACITY_WARN_AT')  || 2),
+  OPS_LEADS_GROUP:   (SP.getProperty('SLACK_USERGROUP_OPS_LEADS')||'').trim(), // <!subteam^ID|name>
+  MANAGE_URL_BASE:   (SP.getProperty('MANAGE_URL_BASE')||'https://www.portcityluggage.com/manage?b=').trim(),
+
+  // Drive
+  DRIVE_COC_ROOT_ID: (SP.getProperty('DRIVE_COC_ROOT_ID')||'').trim() // optional; created on demand if empty
+};
+
+/* ------------------------- sheet & header helpers ------------------------- */
+
+function sheet_(){
+  if (!CFG.SHEET_ID) throw new Error('SHEET_ID missing.');
+  const ss = SpreadsheetApp.openById(CFG.SHEET_ID);
+  let sh = ss.getSheetByName(CFG.SHEET_NAME);
+  if (!sh) sh = ss.insertSheet(CFG.SHEET_NAME);
+  ensureHeaders_(sh);
+  return sh;
+}
+function ensureHeaders_(sh){
+  const need = [
+    'timestamp_utc','status','booking_id',
+    'customer_name','email','phone',
+    'bags','days','base_label',
+    'pickup_time_iso','pickup_slot_local','pickup_addr','pickup_zip',
+    'dropoff_time_iso','dropoff_slot_local','dropoff_addr','dropoff_zip',
+    'addons_json','notes','price_cents',
+    'stripe_session_id','paid_at_utc',
+    'sms_owner_sent','sms_cust_sent',
+    'email_cust_sent','notified_at_utc','extras_payments_json',
+    // Slack + automations
+    'slack_thread_ts','slack_channel_id',
+    'reminder_pickup_sent','reminder_dropoff_sent',
+    'alert_expired_sent','sla_nudged_at_utc',
+    // Chain of custody
+    'coc_folder_id','photos_count','photos_json','photos_updated_utc',
+    // Tags
+    'tags_csv','tags_updated_utc','tags_updated_by',
+    // Operational closeout
+    'closed_at_utc','closed_by',
+    // Slack-paid idempotency
+    'slack_paid_sent_utc'
+  ];
+  const last = Math.max(1, sh.getLastColumn());
+  const row = sh.getRange(1,1,1,last).getValues()[0] || [];
+  if (row.every(v=>String(v||'').trim()==='')){
+    sh.getRange(1,1,1,need.length).setValues([need]);
+    sh.setFrozenRows(1); return;
+  }
+  const have = row.map(v=>String(v||''));
+  let col = have.length;
+  need.forEach(h=>{
+    if (!have.includes(h)) sh.getRange(1, ++col).setValue(h);
+  });
+  if (sh.getFrozenRows()<1) sh.setFrozenRows(1);
+}
+function idx_(sh){
+  const row = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const m={}; row.forEach((h,i)=>{ if (h) m[h]=i; }); return m;
+}
+/** Ensure a header exists; return its ZERO-based index without clearing the sheet. */
+function ensureHeaderIndex_(sh, headerName, idxMap){
+  if (idxMap && idxMap[headerName] !== undefined) return idxMap[headerName];
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const headers = sh.getRange(1,1,1,lastCol).getValues()[0];
+  let i = headers.indexOf(headerName);
+  if (i === -1){
+    i = headers.length; // append new header
+    sh.getRange(1, i+1).setValue(headerName);
+  }
+  return i;
+}
+
+// --- Centralized, race-safe parent creation/updating ---
+function ensureOrUpdateParent_(bookingId, preferPaid){
+  const sh = sheet_(); const ix = idx_(sh);
+
+  // Find row
+  const rows = sh.getDataRange().getValues();
+  let rFound = -1;
+  for (let r=1; r<rows.length; r++){
+    if (String(rows[r][ix.booking_id]||'') === bookingId){ rFound = r; break; }
+  }
+  if (rFound < 0) return null;
+
+  // Small local util
+  function isPriority_(row){
+    const addons = parseAddons_(String(row[ix.addons_json]||'[]'));
+    return addons.some(a => String(a.id||'').toLowerCase()==='priority');
+  }
+
+  let row = rows[rFound];
+  const id    = String(row[ix.booking_id]||'');
+  const chCur = String(row[ix.slack_channel_id]||'').trim() || CFG.CH_OPS_LIVE;
+  let  ts     = String(row[ix.slack_thread_ts]||'').trim();
+
+  // Compose blocks/preview based on desired header (paid vs pending)
+  const status = String(row[ix.status]||'').toUpperCase();
+  const wantPaid = preferPaid || status === 'PAID';
+  const priority = isPriority_(row);
+  const blocks = wantPaid ? buildPaidBlocks_(row, ix, priority) : buildPendingBlocks_(row, ix);
+  const preview = wantPaid ? paidPreviewText_(row, ix, priority) : pendingPreviewText_(row, ix);
+
+  // If we already have a parent, just update it in place.
+  if (ts){
+    try { slackUpdate_(chCur, ts, blocks, preview); } catch(e){
+      if (e && e.slack_error === 'message_not_found'){
+        // Parent was deleted — recreate once under a lock
+        const lock = LockService.getScriptLock(); try { lock.waitLock(5000); } catch(_){}
+        try{
+          // Re-read in case another worker recreated it
+          const fresh = sh.getRange(rFound+1, 1, 1, sh.getLastColumn()).getValues()[0];
+          const ts2 = String(fresh[ix.slack_thread_ts]||'').trim();
+          const ch2 = String(fresh[ix.slack_channel_id]||'').trim() || CFG.CH_OPS_LIVE;
+          if (ts2){
+            slackUpdate_(ch2, ts2, blocks, preview);
+            ts = ts2;
+          } else {
+            const res = slackPost_(CFG.CH_OPS_LIVE, preview, blocks);
+            ts = res.ts; 
+            sh.getRange(rFound+1, ix.slack_thread_ts+1).setValue(ts);
+            sh.getRange(rFound+1, ix.slack_channel_id+1).setValue(res.channel);
+          }
+        } finally { try{ LockService.getScriptLock().releaseLock(); }catch(_){ } }
+      }
+    }
+    return { ts, channel: chCur, rowIndex: rFound };
+  }
+
+  // No parent yet — create exactly once under a lock (double-check inside).
+  const lock = LockService.getScriptLock(); try { lock.waitLock(5000); } catch(_){}
+  try{
+    // Re-read latest row after acquiring the lock
+    const fresh = sh.getRange(rFound+1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const tsFresh = String(fresh[ix.slack_thread_ts]||'').trim();
+    const chFresh = String(fresh[ix.slack_channel_id]||'').trim() || CFG.CH_OPS_LIVE;
+    if (tsFresh){
+      // Someone else created it while we waited — just update
+      try { slackUpdate_(chFresh, tsFresh, blocks, preview); } catch(_){}
+      return { ts: tsFresh, channel: chFresh, rowIndex: rFound };
+    }
+    // Create parent now
+    const res = slackPost_(CFG.CH_OPS_LIVE, preview, blocks);
+    sh.getRange(rFound+1, ix.slack_thread_ts+1).setValue(res.ts);
+    sh.getRange(rFound+1, ix.slack_channel_id+1).setValue(res.channel);
+    return { ts: res.ts, channel: res.channel, rowIndex: rFound };
+  } finally { try{ lock.releaseLock(); }catch(_){ } }
+}
+
+
+/* ------------------------------ time utils ------------------------------ */
+
+function fmtWindow_(iso){
+  if (!iso) return '';
+  const s = new Date(iso);
+  const e = new Date(s.getTime() + CFG.SLOT_MINUTES*60000);
+  return Utilities.formatDate(s, CFG.TZ, 'h:mma')+'–'+Utilities.formatDate(e, CFG.TZ,'h:mma');
+}
+function slotKeyLocal_(iso){
+  const s = new Date(iso);
+  return Utilities.formatDate(s, CFG.TZ, "yyyy-MM-dd'T'HH:mm");
+}
+function minsUntil_(iso){
+  try{ const t = new Date(iso).getTime(); return Math.round((t - Date.now())/60000); }
+  catch(_){ return 999999; }
+}
+
+/* ---------------------------- Slack primitives --------------------------- */
+
+function slackPost_(channel, text, blocks, thread_ts){
+  if (!CFG.SLACK_TOKEN) throw new Error('SLACK_BOT_TOKEN missing.');
+  const payload = { channel, text: text || '' };
+  if (blocks) payload.blocks = JSON.stringify(blocks);
+  if (thread_ts) payload.thread_ts = thread_ts;
+  const r = UrlFetchApp.fetch('https://slack.com/api/chat.postMessage',{
+    method:'post',
+    headers:{ Authorization:'Bearer '+CFG.SLACK_TOKEN },
+    payload, muteHttpExceptions:true
+  });
+  const j = JSON.parse(r.getContentText()||'{}');
+  if (!j.ok) throw new Error('Slack error: '+(j.error||r.getContentText()));
+  return j; // {ok, channel, ts}
+}
+function slackReply_(channel, thread_ts, text){
+  return slackPost_(channel, text, null, thread_ts);
+}
+function slackUpdate_(channel, ts, blocks, text){
+  if (!CFG.SLACK_TOKEN) throw new Error('SLACK_BOT_TOKEN missing.');
+  const body = { channel, ts, text: text || '' };
+  if (blocks) body.blocks = blocks;
+  const r = UrlFetchApp.fetch('https://slack.com/api/chat.update', {
+    method: 'post',
+    contentType: 'application/json; charset=utf-8',
+    headers: { Authorization: 'Bearer ' + CFG.SLACK_TOKEN },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
+  });
+  const j = JSON.parse(r.getContentText()||'{}');
+  if (!j.ok){
+    const err = new Error('Slack error: ' + (j.error || r.getContentText()));
+    err.slack_error = (j && j.error) || 'unknown';
+    throw err;
+  }
+  return j;
+}
+function slackPermalink_(channel, ts){
+  try{
+    const r = UrlFetchApp.fetch('https://slack.com/api/chat.getPermalink',{
+      method:'post',
+      headers:{ Authorization:'Bearer '+CFG.SLACK_TOKEN },
+      payload:{ channel, message_ts: ts }, muteHttpExceptions:true
+    });
+    const j = JSON.parse(r.getContentText()||'{}');
+    return j.ok ? j.permalink : '';
+  }catch(_){ return ''; }
+}
+
+
+
+
+
+/* --------------------------- public web endpoints ------------------------ */
+
+// Slack + Booking + Form share the same doPost/doGet
+
+// --- Unified doPost for Slack + Booking + Tag Form ---
+
+function doPost(e){
+  const raw   = (e && e.postData && e.postData.contents) || '';
+  const ctype = (e && e.postData && e.postData.type) || '';
+
+  // Parse JSON body (Slack events & url_verification, Slack block_actions payload, internal webhooks)
+  let body = null;
+  if (ctype && ctype.indexOf('application/json') >= 0) {
+    try { body = JSON.parse(raw || '{}'); } catch(_) { body = null; }
+  } else if (e && e.parameter && e.parameter.payload) {
+    try { body = JSON.parse(String(e.parameter.payload || '{}')); } catch(_) { body = null; }
+  }
+
+  // Small helper: reject if Slack legacy token doesn't match (only when present)
+  function tokenBad_(tok){ return !!(CFG.SLACK_VERIFY_TOKEN && tok && tok !== CFG.SLACK_VERIFY_TOKEN); }
+
+  // --- A) Slack URL verification (Events API "challenge") ---
+  if (body && body.type === 'url_verification' && body.challenge) {
+    if (tokenBad_(body.token)) return textOut_('bad token');
+    return ContentService.createTextOutput(String(body.challenge)).setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  // --- B) Slack slash commands (/tag, /done) - form-urlencoded ---
+  if (ctype.indexOf('application/x-www-form-urlencoded') >= 0 && e.parameter && e.parameter.command) {
+    const okSig = verifySlack_(e, raw);
+    const okTok = !okSig && !CFG.SLACK_SIGNING
+      ? !(CFG.SLACK_VERIFY_TOKEN && e.parameter.token && e.parameter.token !== CFG.SLACK_VERIFY_TOKEN)
+      : okSig;
+    if (!okSig && !okTok) return textOut_('unauthorized', 401);
+
+    const cmd = String(e.parameter.command || '');
+    if (cmd === '/tag')                           return handleTagCommand_(e.parameter);
+    if (cmd === '/complete' || cmd === '/done')   return handleCloseCommand_(e.parameter);
+    return jsonOut_({ response_type: 'ephemeral', text: 'Unknown command.' });
+  }
+
+  // --- C) Slack interactive block actions (buttons) ---
+  if (body && body.type === 'block_actions') {
+    const okSig = verifySlack_(e, raw);
+    const okTok = !okSig && !CFG.SLACK_SIGNING ? !tokenBad_(body.token) : true;
+    if (!(okSig || okTok)) return textOut_('unauthorized', 401);
+    try { handleBlockActions_(body); } catch(ex){ Logger.log('block_actions error: ' + (ex && ex.stack ? ex.stack : ex)); }
+    return textOut_(''); // fast 200
+  }
+
+  // --- D) Slack event callbacks (message in channel threads for photos) ---
+  if (body && body.type === 'event_callback') {
+    const okSig = verifySlack_(e, raw);
+    const okTok = !okSig && !CFG.SLACK_SIGNING ? !tokenBad_(body.token) : true;
+    if (!(okSig || okTok)) return textOut_('unauthorized', 401);
+
+    const event = body.event || {};
+    if (event.type === 'message' && event.channel && !event.bot_id) {
+      try { onMessageEvent_(event); } catch(_) {}
+    }
+    return textOut_('ok');
+  }
+
+  // --- E) Internal webhook from Booking backend (JSON with secret) ---
+  if (ctype.indexOf('application/json') >= 0 && body) {
+    const secretMatch = (body.secret && body.secret === CFG.INBOUND_SECRET);
+    Logger.log('Webhook recv: ' + JSON.stringify({ type: body.type, booking_id: body.booking_id, ctype, secret_match: !!secretMatch }));
+    if (!secretMatch) return textOut_('bad secret', 403);
+
+    if (body.type === 'booking_created') {
+      try { onBookingCreated_(String(body.booking_id || '')); } catch (ex) { Logger.log('onBookingCreated_ error: ' + (ex && ex.stack ? ex.stack : ex)); }
+      return textOut_('ok');
+    }
+    if (body.type === 'booking_paid') {
+      try { onBookingPaid_(String(body.booking_id || '')); } catch (ex) { Logger.log('onBookingPaid_ error: ' + (ex && ex.stack ? ex.stack : ex)); }
+      return textOut_('ok');
+    }
+  }
+
+  // --- F) Tag form (browser) submit - form-urlencoded ---
+  if (ctype.indexOf('application/x-www-form-urlencoded') >= 0 && e.parameter && e.parameter.action === 'tag_form') {
+    return handleTagFormSubmit_(e.parameter);
+  }
+
+  return textOut_('ok');
+}
+
+
+function doGet(e){
+  // Minimal tag form
+  const b = String((e.parameter && e.parameter.b)||'');
+  const s = Utilities.getUuid(); // one-time anti-CSRF token per render
+  CacheService.getScriptCache().put('tagtok:'+s, '1', 600);
+  const secret = encodeURIComponent(CFG.INBOUND_SECRET);
+  const html = `
+  <!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PCL — Submit Tag Numbers</title>
+  <style>body{font:16px/1.4 -apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px;background:#f6f7f9;}
+  .card{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:22px;}
+  input,button{font:inherit} label{display:block;margin:.5rem 0 .25rem;color:#374151}
+  input[type=text]{width:100%;padding:.6rem .7rem;border:1px solid #d1d5db;border-radius:10px}
+  button{margin-top:14px;background:#0b2e66;color:#fff;border:0;padding:.6rem 1rem;border-radius:10px;font-weight:700}
+  small{color:#6b7280}</style>
+  <div class="card">
+    <h2 style="margin:0 0 10px">Submit tag numbers</h2>
+    <form method="post">
+      <input type="hidden" name="action" value="tag_form">
+      <input type="hidden" name="b" value="${b}">
+      <input type="hidden" name="csrf" value="${s}">
+      <label>Booking ID</label>
+      <input type="text" name="booking_id" value="${b}" required>
+      <label>Tag numbers (comma or space separated)</label>
+      <input type="text" name="tags" placeholder="e.g. 1234, 5678" required>
+      <small>We’ll store these on the booking and post a confirmation in Slack.</small>
+      <button type="submit">Submit</button>
+    </form>
+  </div>`;
+  return HtmlService.createHtmlOutput(html);
+}
+
+/* -------------------------- Slack signature check ------------------------- */
+
+function verifySlack_(e, raw){
+  // Allow browser form posts without Slack headers
+  if (e && e.parameter && e.parameter.action==='tag_form') return true;
+
+  const ts = (e && e.parameter && e.parameter.timestamp) ||
+             (e && e.headers && (e.headers['X-Slack-Request-Timestamp'] || e.headers['x-slack-request-timestamp']));
+  const sig = (e && e.headers && (e.headers['X-Slack-Signature'] || e.headers['x-slack-signature'])) || '';
+  if (!(CFG.SLACK_SIGNING && ts && sig)) return false;
+
+  // Reject stale by >5 minutes
+  if (Math.abs((Date.now()/1000) - Number(ts)) > 60*5) return false;
+
+  const base = 'v0:' + ts + ':' + raw;
+  const mac = Utilities.computeHmacSha256Signature(base, CFG.SLACK_SIGNING);
+  const hex = mac.map(b=>('0'+(b&0xff).toString(16)).slice(-2)).join('');
+  const expect = 'v0=' + hex;
+  return Utilities.secureCompare(expect, sig);
+}
+
+/* ------------------------ Slack block actions (buttons) ------------------------ */
+function handleBlockActions_(payload){
+  if (!payload || !Array.isArray(payload.actions) || !payload.actions.length) return;
+  const act = payload.actions[0];
+  const actionId = String(act.action_id||'');
+  const bookingId = String(act.value||'').toUpperCase();
+
+  // Resolve the thread & row
+  const ch = String(payload.channel && payload.channel.id || CFG.CH_OPS_LIVE);
+  const ts = String((payload.message && payload.message.ts) || (payload.container && payload.container.message_ts) || '');
+  const sh = sheet_(); const ix = idx_(sh);
+  const data = sh.getDataRange().getValues();
+
+  let rFound = -1;
+  for (let r=1;r<data.length;r++){
+    if (String(data[r][ix.booking_id]||'').toUpperCase() === bookingId) { rFound = r; break; }
+  }
+  if (rFound < 0) { 
+    try { slackReply_(ch, ts || null, `⚠️ Could not find booking *${bookingId}*`); } catch(_) {}
+    return;
+  }
+
+  const row = data[rFound];
+  const phone = String(row[ix.phone]||'');
+  const name  = String(row[ix.customer_name]||'');
+  const puIso = String(row[ix.pickup_time_iso]||'');
+  const doIso = String(row[ix.dropoff_time_iso]||'');
+
+  if (actionId === 'resend_sms'){
+    if (!(CFG.TWILIO_SID && CFG.TWILIO_TOKEN && CFG.TWILIO_FROM && phone.startsWith('+'))){
+      slackReply_(ch, ts || null, `✉️ SMS not sent — Twilio not configured or phone invalid.`);
+      return;
+    }
+    const msg = [
+      `✅ Port City Luggage: Booking confirmed (${bookingId}).`,
+      `Pickup ${fmtWindow_(puIso)}`,
+      `Return ${fmtWindow_(doIso)}`,
+      `Reply here for changes or help.`
+    ].join('\n');
+    const ok = twilioSend_(phone, msg);
+    slackReply_(ch, ts || null, ok ? `✉️ Customer SMS re-sent to *${name}*` : `✉️ SMS failed to send.`);
+    return;
+  }
+
+  if (actionId === 'driver_enroute'){
+    // Post a thread notice; optionally also SMS the customer here if desired.
+    slackReply_(ch, ts || null, `🚗 Driver en route — arriving within your pickup window (${fmtWindow_(puIso)}).`);
+    return;
+  }
+}
+
+/* ----------------------------- Twilio (minimal) ------------------------------ */
+function twilioSend_(toE164, text){
+  try{
+    if (!(CFG.TWILIO_SID && CFG.TWILIO_TOKEN && CFG.TWILIO_FROM && toE164)) return false;
+    const url = 'https://api.twilio.com/2010-04-01/Accounts/'+encodeURIComponent(CFG.TWILIO_SID)+'/Messages.json';
+    UrlFetchApp.fetch(url, {
+      method:'post',
+      payload:{ To:toE164, From:CFG.TWILIO_FROM, Body:text },
+      headers:{ Authorization:'Basic '+Utilities.base64Encode(CFG.TWILIO_SID+':'+CFG.TWILIO_TOKEN) },
+      muteHttpExceptions:true
+    });
+    return true;
+  }catch(_){ return false; }
+}
+
+
+
+/* --------------------------- booking lifecycle ---------------------------- */
+
+function onBookingCreated_(bookingId){
+  if (!bookingId) return false;
+  const sh = sheet_(); const ix = idx_(sh);
+  const data = sh.getDataRange().getValues();
+
+  let foundRow = -1;
+  for (let r=1;r<data.length;r++){
+    const cell = String(data[r][ix.booking_id]||'').trim().toUpperCase();
+    if (cell === String(bookingId).trim().toUpperCase()) { foundRow = r; break; }
+  }
+  if (foundRow < 0){ Logger.log('Booking not found in sheet: ' + bookingId); return false; }
+
+  const row = data[foundRow];
+
+  // Ensure parent exists (or create it)
+  let ts = String(row[ix.slack_thread_ts]||'').trim();
+  let ch = String(row[ix.slack_channel_id]||'').trim() || CFG.CH_OPS_LIVE;
+  if (!ts){
+    const blocks  = buildParentBlocks_(row, ix);
+    const preview = pendingPreviewText_(row, ix);
+    const res = slackPost_(CFG.CH_OPS_LIVE, preview, blocks);
+    ts = res.ts; ch = res.channel;
+    sh.getRange(foundRow+1, ix.slack_thread_ts+1).setValue(ts);
+    sh.getRange(foundRow+1, ix.slack_channel_id+1).setValue(ch);
+  } else {
+    // Update parent blocks in case fields changed before creation ping landed
+    try { slackUpdate_(ch, ts, buildParentBlocks_(row, ix), pendingPreviewText_(row, ix)); } catch(_){}
+  }
+
+  // VIP echo
+  const addons = parseAddons_(String(row[ix.addons_json]||'[]'));
+  if (addons.some(a=>String(a.id||'').toLowerCase()==='priority') && CFG.CH_VIP){
+    try { slackPost_(CFG.CH_VIP, `⚡️ VIP pending — ${bookingId}`, buildParentBlocks_(row, ix)); } catch(_){}
+  }
+  return true;
+}
+
+
+function onBookingPaid_(bookingId){
+  const lock = LockService.getScriptLock(); try { lock.waitLock(5000); } catch(_){}
+  try{
+    const sh = sheet_(); const ix = idx_(sh);
+    const rows = sh.getDataRange().getValues();
+
+    for (let r=1; r<rows.length; r++){
+      const row = rows[r];
+      if (String(row[ix.booking_id]||'') !== bookingId) continue;
+
+      // Resolve parent message location (if any)
+      let ts = String(row[ix.slack_thread_ts]||'').trim();
+      let ch = String(row[ix.slack_channel_id]||'').trim() || CFG.CH_OPS_LIVE;
+
+      // Build preview/blocks (with ⚡️ if priority)
+      const addons = parseAddons_(String(row[ix.addons_json]||'[]'));
+      const isPriority = addons.some(a => String(a.id||'').toLowerCase()==='priority');
+
+      const preview = paidPreviewText_(row, ix, isPriority);
+      const blocks  = buildPaidBlocks_(row, ix, isPriority);
+
+      // 1) Ensure there is a parent. If missing, create exactly one.
+      if (!ts){
+        const res = slackPost_(CFG.CH_OPS_LIVE, preview, blocks);
+        ts = res.ts; ch = res.channel;
+        sh.getRange(r+1, ix.slack_thread_ts+1).setValue(ts);
+        sh.getRange(r+1, ix.slack_channel_id+1).setValue(ch);
+      } else {
+        // Update existing parent in place; never create a second parent.
+        try {
+          slackUpdate_(ch, ts, blocks, preview);
+        } catch(e){
+          // Only if truly not found (e.g., message deleted) do we recreate
+          if (e && e.slack_error === 'message_not_found'){
+            const res = slackPost_(CFG.CH_OPS_LIVE, preview, blocks);
+            ts = res.ts; ch = res.channel;
+            sh.getRange(r+1, ix.slack_thread_ts+1).setValue(ts);
+            sh.getRange(r+1, ix.slack_channel_id+1).setValue(ch);
+          } else {
+            Logger.log('slackUpdate_ failed: ' + (e && e.stack ? e.stack : e));
+          }
+        }
+      }
+
+      // 2) Thread reply — exactly once
+      const paidFlagCol = ensureHeaderIndex_(sh, 'slack_paid_sent_utc', ix);
+      const already = String(row[paidFlagCol]||'').trim().length > 0;
+
+      if (!already){
+        // Pre‑stamp to prevent race duplicates
+        sh.getRange(r+1, paidFlagCol+1).setValue(new Date().toISOString());
+
+        const name  = String(row[ix.customer_name]||'');
+        const total = (Number(row[ix.price_cents]||0)/100).toFixed(2);
+        try {
+          slackPost_(ch, '', [
+            {type:'section', text:{type:'mrkdwn', text:`💰 *PAID* *${bookingId}* — ${name} — *$${total}*`}}
+          ], ts);
+        } catch(e){
+          Logger.log('PAID reply post failed: ' + (e && e.stack ? e.stack : e));
+        }
+      }
+
+      break;
+    }
+  } finally { try { lock.releaseLock(); }catch(_){ } }
+}
+
+
+function fmtDay_(iso){
+  if (!iso) return '';
+  return Utilities.formatDate(new Date(iso), CFG.TZ, 'EEE, MMM d'); // e.g., Wed, Aug 21
+}
+
+function pendingPreviewText_(row, ix){
+  const id    = String(row[ix.booking_id]||'');
+  const bags  = Number(row[ix.bags]||0);
+  const puIso = String(row[ix.pickup_time_iso]||'');
+  const puAdr = String(row[ix.pickup_addr]||'');
+  const day   = fmtDay_(puIso);
+  const win   = fmtWindow_(puIso);
+  return `🧳 Pending order • ${id} • ${bags} bag${bags===1?'':'s'} • ${day} ${win} • Pickup: ${puAdr}`;
+}
+
+function paidPreviewText_(row, ix, isPriority){
+  const id    = String(row[ix.booking_id]||'');
+  const name  = String(row[ix.customer_name]||'');
+  const total = (Number(row[ix.price_cents]||0)/100).toFixed(2);
+  const bolt  = isPriority ? '⚡️ ' : '';
+  return `${bolt}💰 PAID • ${id} • ${name} • $${total}`;
+}
+
+
+
+
+/* --------------------------------- blocks -------------------------------- */
+function buildParentBlocks_(row, ix){
+  const status = String(row[ix.status]||'').toUpperCase();
+  return status === 'PAID' ? buildPaidBlocks_(row, ix) : buildPendingBlocks_(row, ix);
+}
+
+function buildPaidBlocks_(row, ix, isPriority){
+  const id    = String(row[ix.booking_id]||'');
+  const name  = String(row[ix.customer_name]||'');
+  const phone = String(row[ix.phone]||'');
+  const email = String(row[ix.email]||'');
+  const bags  = Number(row[ix.bags]||0);
+  const days  = Number(row[ix.days]||1);
+  const puIso = String(row[ix.pickup_time_iso]||'');
+  const puAdr = String(row[ix.pickup_addr]||'');
+  const doIso = String(row[ix.dropoff_time_iso]||'');
+  const doAdr = String(row[ix.dropoff_addr]||'');
+  const price = (Number(row[ix.price_cents]||0)/100).toFixed(2);
+  const addons = parseAddons_(String(row[ix.addons_json]||'[]'));
+  const manageUrl = CFG.MANAGE_URL_BASE + encodeURIComponent(id);
+  const tagUrl = ScriptApp.getService().getUrl() + '?b=' + encodeURIComponent(id);
+  const sheetUrl = CFG.SHEET_ID ? `https://docs.google.com/spreadsheets/d/${CFG.SHEET_ID}/edit` : null;
+
+  const badge = (isPriority ? '⚡️ ' : '') + '💰 *PAID*';
+
+  return [
+    {type:'section',text:{type:'mrkdwn',text:`${badge}  *${id}*\n*${name}* — ${phone} — ${email}\n${bags} bag${bags===1?'':'s'} / ${days} day${days===1?'':'s'}  •  *$${price}*`}},
+    {type:'section',fields:[
+      {type:'mrkdwn', text:`*Pickup*\n${fmtWindow_(puIso)}\n${puAdr}`},
+      {type:'mrkdwn', text:`*Drop‑off*\n${fmtWindow_(doIso)}\n${doAdr}`}
+    ]},
+    {type:'actions',elements:[
+      {type:'button',action_id:'resend_sms',text:{type:'plain_text',text:'✉️ Resend SMS'}, value:id},
+      {type:'button',action_id:'driver_enroute',text:{type:'plain_text',text:'🚗 Driver en route'}, value:id},
+      {type:'button',text:{type:'plain_text',text:'Open Manage'}, url: manageUrl},
+      {type:'button',text:{type:'plain_text',text:'Submit tags'}, url: tagUrl},
+      ...(sheetUrl ? [{type:'button',text:{type:'plain_text',text:'Open Sheet'}, url: sheetUrl}] : [])
+    ]},
+    {type:'context',elements:[
+      {type:'mrkdwn',text: addons.length?`Add‑ons: ${addons.map(a=>a.label||a.id).join(', ')}` : 'No add‑ons'}
+    ]},
+    {type:'divider'}
+  ];
+}
+
+function buildPendingBlocks_(row, ix){
+  const id    = String(row[ix.booking_id]||'');
+  const name  = String(row[ix.customer_name]||'');
+  const phone = String(row[ix.phone]||'');
+  const email = String(row[ix.email]||'');
+  const bags  = Number(row[ix.bags]||0);
+  const days  = Number(row[ix.days]||1);
+  const puIso = String(row[ix.pickup_time_iso]||'');
+  const puAdr = String(row[ix.pickup_addr]||'');
+  const doIso = String(row[ix.dropoff_time_iso]||'');
+  const doAdr = String(row[ix.dropoff_addr]||'');
+  const addons = parseAddons_(String(row[ix.addons_json]||'[]'));
+  const priority = addons.some(a=>String(a.id||'').toLowerCase()==='priority');
+  const urgent = priority && minsUntil_(String(row[ix.pickup_time_iso]||'')) <= 60;
+  const manageUrl = CFG.MANAGE_URL_BASE + encodeURIComponent(id);
+  const tagUrl = ScriptApp.getService().getUrl() + '?b=' + encodeURIComponent(id);
+  const sheetUrl = CFG.SHEET_ID ? `https://docs.google.com/spreadsheets/d/${CFG.SHEET_ID}/edit` : null;
+
+  const badge = priority ? '⚡️ *PRIORITY*' : '🧳 *PENDING*';
+  return [
+    {type:'section',text:{type:'mrkdwn',text:`${badge} ${urgent?'🚨':''}  *${id}*\n*${name}* — ${phone} — ${email}\n${bags} bag${bags===1?'':'s'} / ${days} day${days===1?'':'s'}`}},
+    {type:'section',fields:[
+      {type:'mrkdwn', text:`*Pickup*\n${fmtDay_(puIso)} · ${fmtWindow_(puIso)}\n${puAdr}`},
+      {type:'mrkdwn', text:`*Drop‑off*\n${fmtDay_(doIso)} · ${fmtWindow_(doIso)}\n${doAdr}`}
+    ]},
+    {type:'actions',elements:[
+      {type:'button',action_id:'resend_sms',text:{type:'plain_text',text:'✉️ Resend SMS'}, value:id},
+      {type:'button',action_id:'driver_enroute',text:{type:'plain_text',text:'🚗 Driver en route'}, value:id},
+      {type:'button',text:{type:'plain_text',text:'Open Manage'}, url: manageUrl},
+      {type:'button',text:{type:'plain_text',text:'Submit tags'}, url: tagUrl},
+      ...(sheetUrl ? [{type:'button',text:{type:'plain_text',text:'Open Sheet'}, url: sheetUrl}] : [])
+    ]},
+    {type:'context',elements:[
+      {type:'mrkdwn',text: addons.length?`Add‑ons: ${addons.map(a=>a.label||a.id).join(', ')}` : 'No add‑ons'}
+    ]},
+    {type:'divider'}
+  ];
+}
+
+
+function parseAddons_(json){
+  try{
+    const a = JSON.parse(json||'[]');
+    return Array.isArray(a) ? a.map(x=>({id:String(x.id||''),label:String(x.label||x.id||''),amount:Number(x.amount||0)})) : [];
+  }catch(_){ return []; }
+}
+
+/* ------------------------ time-based automations ------------------------- */
+
+// Every 5 minutes (set up by setupTriggers_())
+function timers_(){
+  try{ reminders30_(); }catch(_){}
+  try{ ttlAndSLA_(); }catch(_){}
+  try{ capacityWarn_(); }catch(_){}
+}
+
+function reminders30_(){
+  const sh = sheet_(); const ix = idx_(sh);
+  const rows = sh.getDataRange().getValues();
+  for (let r=1;r<rows.length;r++){
+    const row = rows[r];
+    if (String(row[ix.status]||'').toUpperCase() !== 'PAID') continue;
+
+    let ts = String(row[ix.slack_thread_ts]||'').trim();
+    let ch = String(row[ix.slack_channel_id]||'').trim() || CFG.CH_OPS_LIVE;
+
+    if (!ts){
+  const preview = paidPreviewText_(row, ix);
+  const res = slackPost_(CFG.CH_OPS_LIVE, preview, buildPaidBlocks_(row, ix));
+  ts = res.ts; ch = res.channel;
+  sh.getRange(r+1, ix.slack_thread_ts+1).setValue(ts);
+  sh.getRange(r+1, ix.slack_channel_id+1).setValue(ch);
+}
+
+
+    // pickup
+    const puIso = String(row[ix.pickup_time_iso]||'');
+    const puMin = minsUntil_(puIso);
+    if (!String(row[ix.reminder_pickup_sent]||'').trim() && puMin>=25 && puMin<=35){
+      slackReply_(ch, ts, `⏰ *30 min until pickup* — ${fmtWindow_(puIso)}`);
+      sh.getRange(r+1, ix.reminder_pickup_sent+1).setValue(new Date().toISOString());
+    }
+    // drop-off
+    const doIso = String(row[ix.dropoff_time_iso]||'');
+    const doMin = minsUntil_(doIso);
+    if (!String(row[ix.reminder_dropoff_sent]||'').trim() && doMin>=25 && doMin<=35){
+      slackReply_(ch, ts, `⏰ *30 min until drop-off* — ${fmtWindow_(doIso)}`);
+      sh.getRange(r+1, ix.reminder_dropoff_sent+1).setValue(new Date().toISOString());
+    }
+  }
+}
+
+function ttlAndSLA_(){
+  const sh = sheet_(); const ix = idx_(sh);
+  const rows = sh.getDataRange().getValues();
+  const ttlMs = Math.max(1, CFG.PENDING_TTL_MIN)*60*1000;
+  for (let r=1;r<rows.length;r++){
+    const row = rows[r];
+    const status = String(row[ix.status]||'').toUpperCase();
+    if (status!=='PENDING') continue;
+
+    const ts = rows[r][ix.timestamp_utc];
+    const t  = ts ? new Date(ts).getTime() : 0;
+    const expiredFlag = String(row[ix.alert_expired_sent]||'').trim();
+    const nudged = String(row[ix.sla_nudged_at_utc]||'').trim();
+
+    // Abandoned TTL
+    if (t && (Date.now()-t)>ttlMs && !expiredFlag){
+      const id = String(row[ix.booking_id]||'');
+      const name = String(row[ix.customer_name]||'');
+      slackPost_(CFG.CH_ALERTS, `⛔️ *PENDING hold expired* — ${id} — ${name}${subteamMention_()}`);
+      sh.getRange(r+1, ix.alert_expired_sent+1).setValue(new Date().toISOString());
+    }
+
+    // SLA nudge (5 minutes after creation if still pending)
+    if (t && (Date.now()-t)>5*60*1000 && !nudged){
+      let th = String(row[ix.slack_thread_ts]||'').trim();
+      let ch = String(row[ix.slack_channel_id]||'').trim() || CFG.CH_OPS_LIVE;
+      if (!th){
+      const preview = pendingPreviewText_(row, ix);
+      const res = slackPost_(CFG.CH_OPS_LIVE, preview, buildPendingBlocks_(row, ix));
+      th = res.ts; ch = res.channel;
+      sh.getRange(r+1, ix.slack_thread_ts+1).setValue(th);
+      sh.getRange(r+1, ix.slack_channel_id+1).setValue(ch);
+  }
+
+      slackReply_(ch, th, `👋 Heads up — this booking is still *PENDING* after 5 minutes.${subteamMention_()}`);
+      sh.getRange(r+1, ix.sla_nudged_at_utc+1).setValue(new Date().toISOString());
+    }
+  }
+}
+
+function capacityWarn_(){
+  const sh = sheet_(); const ix = idx_(sh);
+  const cap = Math.max(1, CFG.CAPACITY_PER_SLOT|0);
+  const warnAt = Math.max(1, CFG.CAPACITY_WARN_AT|0);
+
+  const pick = new Map(), drop = new Map();
+  const rows = sh.getDataRange().getValues();
+  for (let r=1;r<rows.length;r++){
+    const row = rows[r];
+    const st = String(row[ix.status]||'').toUpperCase();
+    if (st!=='PENDING' && st!=='PAID') continue;
+    const pu = String(row[ix.pickup_time_iso]||''); if (pu){ const k=slotKeyLocal_(pu); pick.set(k,(pick.get(k)||0)+1); }
+    const du = String(row[ix.dropoff_time_iso]||''); if (du){ const k=slotKeyLocal_(du); drop.set(k,(drop.get(k)||0)+1); }
+  }
+
+  const sent = readFlagSet_('CAP_FLAGS_JSON');
+  const announce = (kind,k,count)=>{
+    const key = `${kind}:${k}`; if (sent.has(key)) return;
+    slackPost_(CFG.CH_CAPACITY, `🚦 *${kind.toUpperCase()} near full* — ${k}  (${count}/${cap})${subteamMention_()}`);
+    sent.add(key);
+  };
+  for (const [k,c] of pick){ if (c>=warnAt) announce('pickup',k,c); }
+  for (const [k,c] of drop){ if (c>=warnAt) announce('drop-off',k,c); }
+  writeFlagSet_('CAP_FLAGS_JSON', sent, 2000);
+}
+
+/* ------------------------------- morning brief ---------------------------- */
+
+// Run daily ~7am
+function morningBrief_(){
+  const sh = sheet_(); const ix = idx_(sh);
+  const rows = sh.getDataRange().getValues();
+  const today = Utilities.formatDate(new Date(), CFG.TZ, 'yyyy-MM-dd');
+
+  const pick=[], drop=[], risk=[];
+  for (let r=1;r<rows.length;r++){
+    const row = rows[r]; const st = String(row[ix.status]||'').toUpperCase();
+    const pu = String(row[ix.pickup_time_iso]||''); const du = String(row[ix.dropoff_time_iso]||'');
+    const puD = pu && Utilities.formatDate(new Date(pu), CFG.TZ,'yyyy-MM-dd');
+    const duD = du && Utilities.formatDate(new Date(du), CFG.TZ,'yyyy-MM-dd');
+
+    if (st==='PAID'){
+      if (pu && puD===today) pick.push(`• Pickup ${fmtWindow_(pu)} — ${row[ix.customer_name]} (${row[ix.phone]})`);
+      if (du && duD===today) drop.push(`• Drop-off ${fmtWindow_(du)} — ${row[ix.customer_name]} (${row[ix.phone]})`);
+
+      // risk flags
+      const noTags = !String(row[ix.tags_csv]||'').trim();
+      const photoCount = Number(row[ix.photos_count]||0);
+      if (noTags || photoCount===0){
+        risk.push(`• ${row[ix.booking_id]} — ${row[ix.customer_name]} ${noTags?'(no tags)':''} ${photoCount===0?'(no photos)':''}`.trim());
+      }
+    }
+  }
+
+  const lines = [];
+  lines.push(`📋 *Morning Brief — ${Utilities.formatDate(new Date(), CFG.TZ, 'EEE, MMM d')}*`);
+  lines.push('');
+  lines.push('*Pickups*');  lines.push(...(pick.length?pick:['• none']));
+  lines.push('');
+  lines.push('*Drop-offs*'); lines.push(...(drop.length?drop:['• none']));
+  lines.push('');
+  lines.push('*Risk watch*'); lines.push(...(risk.length?risk:['• none']));
+  // Reset capacity flags daily
+  writeFlagSet_('CAP_FLAGS_JSON', new Set(), 2000);
+  slackPost_(CFG.CH_OPS_LIVE, lines.join('\n'));
+
+}
+
+/* ------------------------------ chain-of-custody -------------------------- */
+
+// We listen to message events; if a message in a booking thread includes files, we save.
+
+function onMessageEvent_(ev){
+  // only consider ops-live
+  if (CFG.CH_OPS_LIVE && ev.channel !== CFG.CH_OPS_LIVE) return;
+
+  // find booking by thread_ts
+  const threadTs = ev.thread_ts || ''; // replies have thread_ts; top-level has none
+  const possibleTs = threadTs || ev.ts; // if the very first message had files (unlikely), still catch
+  if (!possibleTs) return;
+
+  const sh = sheet_(); const ix = idx_(sh);
+  const data = sh.getDataRange().getValues();
+  let rFound=-1;
+  for (let r=1;r<data.length;r++){
+    if (String(data[r][ix.slack_thread_ts]||'') === possibleTs){ rFound=r; break; }
+  }
+  if (rFound<0) return; // not a booking thread
+
+  const row = data[rFound];
+  const bookingId = String(row[ix.booking_id]||'');
+  const files = (ev.files && ev.files.length) ? ev.files : [];
+  if (!files.length) return;
+
+  // Ensure folder
+  const folderId = ensureCoCFolder_(bookingId);
+  sh.getRange(rFound+1, ix.coc_folder_id+1).setValue(folderId);
+
+  // Save each file to Drive
+  const saved = [];
+  files.forEach(f=>{
+    try{
+      const result = saveSlackFileToDrive_(f, folderId);
+      saved.push(result);
+    }catch(_){}
+  });
+
+  // Update sheet + reply
+  if (saved.length){
+    let count = Number(row[ix.photos_count]||0) + saved.length;
+    sh.getRange(rFound+1, ix.photos_count+1).setValue(count);
+
+    // append to photos_json (ring buffer-ish)
+    let arr=[]; try{ arr = JSON.parse(String(row[ix.photos_json]||'[]')); if(!Array.isArray(arr)) arr=[]; }catch(_){arr=[];}
+    saved.forEach(s=>arr.push(s));
+    if (arr.length>200) arr = arr.slice(arr.length-200);
+    sh.getRange(rFound+1, ix.photos_json+1).setValue(JSON.stringify(arr));
+    const photosUpdatedCol = ensureHeaderIndex_(sh,'photos_updated_utc',ix);
+    sh.getRange(rFound+1, photosUpdatedCol+1).setValue(new Date().toISOString());
+
+    slackReply_(CFG.CH_OPS_LIVE, possibleTs, `🧾 Chain of custody: saved *${saved.length}* file(s) to Drive folder for *${bookingId}*`);
+  }
+}
+
+function ensureCoCFolder_(bookingId){
+  let rootId = CFG.DRIVE_COC_ROOT_ID;
+  let root;
+  if (rootId){
+    try{ root = DriveApp.getFolderById(rootId); }catch(_){ root = null; }
+  }
+  if (!root){
+    root = DriveApp.createFolder('PCL Chain of Custody');
+    SP.setProperty('DRIVE_COC_ROOT_ID', root.getId());
+  }
+
+  const name = bookingId || ('BKG_'+Utilities.getUuid().slice(0,8).toUpperCase());
+  // Reuse if exists
+  const it = root.getFoldersByName(name);
+  if (it.hasNext()) return it.next().getId();
+  return root.createFolder(name).getId();
+}
+
+function saveSlackFileToDrive_(fileObj, folderId){
+  const url = fileObj.url_private_download || fileObj.url_private || '';
+  const name = fileObj.name || ('slack_'+fileObj.id||Utilities.getUuid());
+  if (!url) throw new Error('missing file url');
+
+  const res = UrlFetchApp.fetch(url, { method:'get', headers:{ Authorization:'Bearer '+CFG.SLACK_TOKEN }, muteHttpExceptions:true });
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) throw new Error('Slack file download failed: ' + code);
+
+  const blob = res.getBlob().setName(name);
+  const size = blob.getBytes().length;
+  if (size > 25 * 1024 * 1024) throw new Error('File too large for CoC (>25MB)');
+
+  const type = (blob.getContentType()||'').toLowerCase();
+  if (!/^image\//.test(type)) throw new Error('Non-image file rejected for CoC: ' + type);
+
+  const folder = DriveApp.getFolderById(folderId);
+  const f = folder.createFile(blob);
+
+  return {
+    ts: new Date().toISOString(),
+    slack_file_id: fileObj.id || '',
+    drive_file_id: f.getId(),
+    name: f.getName(),
+    size: f.getSize()
+  };
+}
+
+/* --------------------------------- tags ----------------------------------- */
+
+// 1) /tag slash command
+function handleTagCommand_(p){
+  const channel_id = String(p.channel_id||'');
+  const user_name  = String(p.user_name||'');
+  const text       = String(p.text||'').trim(); // may be "BKG_XXXX 1234 5678" OR "1234 5678" if used inside thread
+  const thread_ts  = String(p.thread_ts||'');   // Slack passes thread_ts for replies
+
+  let bookingId = '';
+  let tagsText  = '';
+
+  const m = text.match(/(BKG_[A-Z0-9]{4,})\s+(.*)$/i);
+  if (m){ bookingId = m[1].toUpperCase(); tagsText = m[2]; }
+  else {
+    // try resolve via thread
+    if (thread_ts){
+      const found = findBookingByThread_(thread_ts);
+      if (found) bookingId = found.booking_id;
+    }
+    tagsText = text;
+  }
+
+  if (!bookingId) return jsonOut_({ response_type:'ephemeral', text:'Usage: `/tag BKG_XXXX 1234 5678` (or run inside a booking thread and just send numbers).' });
+
+  const parsed = parseTags_(tagsText);
+  if (!parsed.length) return jsonOut_({ response_type:'ephemeral', text:'No tag numbers found. Separate with spaces or commas.' });
+
+  const ok = writeTags_(bookingId, parsed, p.user_name);
+  if (!ok) return jsonOut_({ response_type:'ephemeral', text:`Booking ${bookingId} not found.` });
+
+  // post confirmation into thread if we can find it
+  const loc = findBookingById_(bookingId);
+  if (loc && loc.slack_thread_ts){
+    slackReply_(loc.slack_channel_id||CFG.CH_OPS_LIVE, loc.slack_thread_ts, `🏷️ Tags recorded by *${user_name}*: ${parsed.join(', ')}`);
+  }
+
+  return jsonOut_({ response_type:'ephemeral', text:`Saved tags for ${bookingId}: ${parsed.join(', ')}` });
+}
+
+function parseTags_(t){
+  return String(t||'')
+    .replace(/[^\d,\s-]/g,' ')
+    .split(/[\s,]+/)
+    .map(s=>s.trim())
+    .filter(Boolean);
+}
+
+function writeTags_(bookingId, tags, by){
+  const sh = sheet_(); const ix = idx_(sh);
+  const rows = sh.getDataRange().getValues();
+  for (let r=1;r<rows.length;r++){
+    if (String(rows[r][ix.booking_id]||'') === bookingId){
+      sh.getRange(r+1, ix.tags_csv+1).setValue(tags.join(', '));
+      sh.getRange(r+1, ix.tags_updated_utc+1).setValue(new Date().toISOString());
+      const byCol = ensureHeaderIndex_(sh,'tags_updated_by', ix);
+      sh.getRange(r+1, byCol+1).setValue(String(by||''));
+      return true;
+    }
+  }
+  return false;
+}
+
+function findBookingByThread_(thread_ts){
+  const sh = sheet_(); const ix = idx_(sh);
+  const rows = sh.getDataRange().getValues();
+  for (let r=1;r<rows.length;r++){
+    if (String(rows[r][ix.slack_thread_ts]||'') === thread_ts){
+      return {
+        booking_id: String(rows[r][ix.booking_id]||''),
+        slack_thread_ts: thread_ts,
+        slack_channel_id: String(rows[r][ix.slack_channel_id]||'') || CFG.CH_OPS_LIVE
+      };
+    }
+  }
+  return null;
+}
+function findBookingById_(bookingId){
+  const sh = sheet_(); const ix = idx_(sh);
+  const rows = sh.getDataRange().getValues();
+  for (let r=1;r<rows.length;r++){
+    if (String(rows[r][ix.booking_id]||'') === bookingId){
+      return {
+        booking_id: bookingId,
+        slack_thread_ts: String(rows[r][ix.slack_thread_ts]||''),
+        slack_channel_id: String(rows[r][ix.slack_channel_id]||'') || CFG.CH_OPS_LIVE
+      };
+    }
+  }
+  return null;
+}
+
+// 2) Tag form submit (browser)
+function handleTagFormSubmit_(p){
+  const csrf = String(p.csrf||'');
+  const okTok = CacheService.getScriptCache().get('tagtok:'+csrf)==='1';
+  if (!okTok) return textOut_('expired form', 400);
+
+  // removed INBOUND_SECRET check — rely on CSRF-only for browser form
+
+  const bookingId = String(p.booking_id||'').trim().toUpperCase();
+  const tags = parseTags_(String(p.tags||''));
+  if (!bookingId || !tags.length) return textOut_('Missing booking or tags', 400);
+
+  if (!writeTags_(bookingId, tags)) return textOut_('Booking not found', 404);
+
+  const loc = findBookingById_(bookingId);
+  if (loc && loc.slack_thread_ts){
+    slackReply_(loc.slack_channel_id, loc.slack_thread_ts, `🏷️ Tags recorded via form: ${tags.join(', ')}`);
+  }
+  return HtmlService.createHtmlOutput('<p style="font:16px -apple-system,Segoe UI,Roboto,Arial">Thanks — tags saved.</p>');
+}
+
+/* --------------------------------- close ---------------------------------- */
+
+// /done — mark closed (end of chain-of-custody)
+function handleCloseCommand_(p){
+  const text = String(p.text||'').trim();
+  let bookingId = '';
+  const m = text.match(/(BKG_[A-Z0-9]{4,})/i);
+  if (m) bookingId = m[1].toUpperCase(); else {
+    const t = String(p.thread_ts||''); const loc = t ? findBookingByThread_(t) : null;
+    if (loc) bookingId = loc.booking_id;
+  }
+  if (!bookingId) return jsonOut_({ response_type:'ephemeral', text:'Usage: `/done BKG_XXXX` (or run inside the booking thread).' });
+
+  const sh = sheet_(); const ix = idx_(sh);
+  const rows = sh.getDataRange().getValues();
+  for (let r=1;r<rows.length;r++){
+    if (String(rows[r][ix.booking_id]||'') === bookingId){
+      sh.getRange(r+1, ix.closed_at_utc+1).setValue(new Date().toISOString());
+      const byCol = ensureHeaderIndex_(sh,'closed_by', ix);
+      sh.getRange(r+1, byCol+1).setValue(String(p.user_name||''));
+      const loc = findBookingById_(bookingId);
+      if (loc && loc.slack_thread_ts){
+        slackReply_(loc.slack_channel_id, loc.slack_thread_ts, `✅ *Closed* — chain-of-custody complete for ${bookingId}`);
+      }
+      return jsonOut_({ response_type:'ephemeral', text:`Closed ${bookingId}.` });
+    }
+  }
+  return jsonOut_({ response_type:'ephemeral', text:`Booking ${bookingId} not found.` });
+}
+
+/* ---------------------------- flag set helpers ---------------------------- */
+
+function readFlagSet_(key){
+  try{ return new Set(JSON.parse(SP.getProperty(key)||'[]')); }catch(_){ return new Set(); }
+}
+function writeFlagSet_(key, set, max){
+  const arr = Array.from(set); if (max && arr.length>max) arr.splice(0, arr.length-max);
+  SP.setProperty(key, JSON.stringify(arr));
+}
+
+/* ---------------------------- outputs & misc ------------------------------ */
+
+function textOut_(s){
+  return ContentService.createTextOutput(String(s));
+}
+
+function jsonOut_(obj){
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/* ------------------------------- triggers -------------------------------- */
+
+function setupTriggers_(){
+  // clear
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if (['timers_','morningBrief_'].includes(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('timers_').timeBased().everyMinutes(5).create();
+  ScriptApp.newTrigger('morningBrief_').timeBased().atHour(7).nearMinute(0).everyDays(1).create();
+}
+
+/* ------------------------------- smoketests -------------------------------- */
+
+function _slack_bot_smoke_test(){
+  if (!CFG.SLACK_TOKEN) throw new Error('SLACK_BOT_TOKEN missing');
+  if (!CFG.CH_OPS_LIVE) throw new Error('SLACK_CH_OPS_LIVE missing');
+  const r = UrlFetchApp.fetch('https://slack.com/api/chat.postMessage',{
+    method:'post',
+    headers:{ Authorization:'Bearer '+CFG.SLACK_TOKEN },
+    payload:{ channel: CFG.CH_OPS_LIVE, text: '✅ Slack bot smoke test' },
+    muteHttpExceptions:true
+  });
+  Logger.log(r.getResponseCode()+' '+r.getContentText());
+}
+
+function _print_slack_props(){
+  const sp = PropertiesService.getScriptProperties();
+  Logger.log('SLACK.SHEET_ID=' + sp.getProperty('SHEET_ID'));
+  Logger.log('SLACK.INBOUND_SECRET=' + sp.getProperty('INBOUND_SECRET'));
+  Logger.log('SLACK.CH_OPS_LIVE=' + sp.getProperty('SLACK_CH_OPS_LIVE'));
+}
+
+function _smoke_created(){
+  onBookingCreated_('BKG_0A6C002C');
+}
+
+function _smoke_paid(){
+  onBookingPaid_('BKG_0A6C002C');
+}
+
+/** ========= PCL Sheet Protocol Audit (read-only) =========
+ * Add this file to any of your PCL Apps Script projects.
+ * You can run:
+ *   • Run_Audit          (appears in the Run menu)
+ *   • PCL Debug → Run Audit  (via spreadsheet menu)
+ */
+
+function Run_Audit(){                 // <— shows up in Run menu
+  const report = auditSheetProtocol_();
+  Logger.log('Audit done. See the "Sheet_Audit" tab and Logs.');
+  return report;
+}
+
+function onOpen(){                    // optional: adds a spreadsheet menu
+  try{
+    SpreadsheetApp.getUi()
+      .createMenu('PCL Debug')
+      .addItem('Run Audit','Run_Audit')
+      .addToUi();
+  }catch(_){ /* ok if not bound to a spreadsheet */ }
+}
+
+// --------- Actual audit function (read-only) ----------
+function auditSheetProtocol_(){
+  const SP = PropertiesService.getScriptProperties();
+  const SHEET_ID   = SP.getProperty('SHEET_ID');
+  const SHEET_NAME = SP.getProperty('SHEET_NAME') || 'PCL_Bookings';
+  if (!SHEET_ID) throw new Error('SHEET_ID missing in Script Properties');
+
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName(SHEET_NAME);
+  if (!sh) throw new Error('Sheet not found: '+SHEET_NAME);
+
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const headers  = sh.getRange(1,1,1,lastCol).getValues()[0] || [];
+  const formulas = sh.getRange(1,1,1,lastCol).getFormulas()[0] || [];
+
+  // Expected union from your scripts
+  const expected = new Set([
+    'timestamp_utc','status','booking_id',
+    'customer_name','email','phone',
+    'bags','days','base_label',
+    'pickup_time_iso','pickup_slot_local','pickup_addr','pickup_zip',
+    'dropoff_time_iso','dropoff_slot_local','dropoff_addr','dropoff_zip',
+    'addons_json','notes','price_cents',
+    'stripe_session_id','paid_at_utc',
+    'sms_owner_sent','sms_cust_sent',
+    'email_cust_sent','notified_at_utc','extras_payments_json',
+    'slack_thread_ts','slack_channel_id',
+    'reminder_pickup_sent','reminder_dropoff_sent',
+    'alert_expired_sent','sla_nudged_at_utc',
+    'coc_folder_id','photos_count','photos_json','photos_updated_utc',
+    'tags_csv','tags_updated_utc','tags_updated_by',
+    'closed_at_utc','closed_by',
+    'slack_paid_sent_utc'
+  ]);
+
+  const anomalies = {
+    header_cells_with_formulas: [],
+    header_cells_with_errors: [],
+    unexpected_headers: [],
+    missing_expected_headers: [],
+    duplicate_headers: [],
+    blank_header_cells: []
+  };
+
+  const seen = new Map();
+  headers.forEach((h,i)=>{
+    const text = String(h||'').trim();
+    const fml  = String(formulas[i]||'').trim();
+    if (!text) anomalies.blank_header_cells.push({col:i+1});
+    if (fml) anomalies.header_cells_with_formulas.push({col:i+1, formula:fml});
+    if (/^#(REF|N\/A|DIV\/0|NAME|VALUE|ERROR|NUM)!/i.test(text)) {
+      anomalies.header_cells_with_errors.push({col:i+1, display:text});
+    }
+    if (text){
+      seen.set(text, (seen.get(text)||0)+1);
+      if (!expected.has(text)) anomalies.unexpected_headers.push({col:i+1, header:text});
+    }
+  });
+  seen.forEach((count,key)=>{ if (count>1) anomalies.duplicate_headers.push({header:key, count}); });
+  expected.forEach(h=>{ if (!headers.includes(h)) anomalies.missing_expected_headers.push(h); });
+
+  // Sample row 2 values (if present)
+  const sampleRow = sh.getLastRow() >= 2 ? sh.getRange(2,1,1,lastCol).getValues()[0] : null;
+  const sample = {};
+  if (sampleRow){
+    const pick = (name)=>{ const idx = headers.indexOf(name); return idx>=0 ? sampleRow[idx] : undefined; };
+    sample.status = pick('status');
+    sample.booking_id = pick('booking_id');
+    sample.pickup_time_iso = pick('pickup_time_iso');
+    sample.dropoff_time_iso = pick('dropoff_time_iso');
+    sample.price_cents = pick('price_cents');
+  }
+
+  // Emit compact sheet report
+  const title = 'Sheet_Audit';
+  let rep = ss.getSheetByName(title); if (!rep) rep = ss.insertSheet(title);
+  rep.clear();
+  rep.getRange(1,1,1,2).setValues([['Audit Item','Details']]);
+  let r = 2;
+  function line(k,v){
+    rep.getRange(r,1).setValue(k);
+    rep.getRange(r,2).setValue(typeof v==='string'?v:JSON.stringify(v));
+    r++;
+  }
+  line('Header count', String(headers.length));
+  line('Header cells with formulas', anomalies.header_cells_with_formulas.length ? anomalies.header_cells_with_formulas : 'none');
+  line('Header cells showing errors', anomalies.header_cells_with_errors.length ? anomalies.header_cells_with_errors : 'none');
+  line('Duplicate headers', anomalies.duplicate_headers.length ? anomalies.duplicate_headers : 'none');
+  line('Unexpected headers (not in union)', anomalies.unexpected_headers.length ? anomalies.unexpected_headers : 'none');
+  line('Missing expected headers', anomalies.missing_expected_headers.length ? anomalies.missing_expected_headers : 'none');
+  line('Blank header cells', anomalies.blank_header_cells.length ? anomalies.blank_header_cells : 'none');
+  if (sampleRow){
+    line('Sample row status', String(sample.status||''));
+    line('Sample row booking_id', String(sample.booking_id||''));
+    line('Sample pickup_time_iso', String(sample.pickup_time_iso||''));
+    line('Sample dropoff_time_iso', String(sample.dropoff_time_iso||''));
+    line('Sample price_cents', String(sample.price_cents||''));
+  }
+
+  const report = { headers, formulas, anomalies, sample };
+  Logger.log(JSON.stringify(report,null,2));
+  return report;
+}
+
+/** ========= One-time header repair for PCL_Bookings =========
+ * Run: Repair_PCL_Headers   (appears in the Run menu)
+ * Safe: makes a backup sheet for anything it removes/moves.
+ */
+
+function Repair_PCL_Headers(){
+  const SP = PropertiesService.getScriptProperties();
+  const SHEET_ID   = SP.getProperty('SHEET_ID');
+  const SHEET_NAME = SP.getProperty('SHEET_NAME') || 'PCL_Bookings';
+  if (!SHEET_ID) throw new Error('SHEET_ID missing in Script Properties');
+
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName(SHEET_NAME);
+  if (!sh) throw new Error('Sheet not found: '+SHEET_NAME);
+
+  // The canonical union of headers used across Booking/Slack/Lookup
+  const expected = [
+    'timestamp_utc','status','booking_id',
+    'customer_name','email','phone',
+    'bags','days','base_label',
+    'pickup_time_iso','pickup_slot_local','pickup_addr','pickup_zip',
+    'dropoff_time_iso','dropoff_slot_local','dropoff_addr','dropoff_zip',
+    'addons_json','notes','price_cents',
+    'stripe_session_id','paid_at_utc',
+    'sms_owner_sent','sms_cust_sent',
+    'email_cust_sent','notified_at_utc','extras_payments_json',
+    // Slack / ops
+    'slack_thread_ts','slack_channel_id',
+    'reminder_pickup_sent','reminder_dropoff_sent',
+    'alert_expired_sent','sla_nudged_at_utc',
+    'coc_folder_id','photos_count','photos_json','photos_updated_utc',
+    'tags_csv','tags_updated_utc','tags_updated_by',
+    'closed_at_utc','closed_by',
+    // idempotency
+    'slack_paid_sent_utc'
+  ];
+
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const headers = sh.getRange(1,1,1,lastCol).getValues()[0] || [];
+  const badCols = []; // 1-based indexes of unexpected headers like "#NUM!"
+
+  // Identify unexpected header cells (anything not in expected and not empty)
+  for (let c=1; c<=lastCol; c++){
+    const v = String(headers[c-1]||'').trim();
+    if (!v) continue;
+    if (!expected.includes(v)){
+      // These are the "extra" columns we plan to remove or relocate
+      badCols.push(c);
+    }
+  }
+
+  if (!badCols.length){
+    Logger.log('No unexpected headers to clean. Nothing to do.');
+    return;
+  }
+
+  // Create a backup sheet with a timestamp
+  const ts = Utilities.formatDate(new Date(), SP.getProperty('TZ')||'America/New_York', "yyyyMMdd_HHmmss");
+  const backup = ss.insertSheet('PCL_HeaderBackup_' + ts);
+  backup.getRange(1,1,1,2).setValues([['Note','Created by Repair_PCL_Headers']]);
+  let br = 3;
+  // Save the whole original header row into backup (for reference)
+  backup.getRange(2,1).setValue('Original header row:');
+  backup.getRange(br,1,1,headers.length).setValues([headers]);
+  br += 2;
+
+  // We will walk from RIGHT to LEFT when removing columns, so indexes stay stable
+  badCols.sort((a,b)=>b-a);
+
+  const rows = sh.getLastRow();
+  const toDelete = [];
+  const toMove = [];
+
+  // Split bad columns into those we can delete (empty below row 1) vs must preserve (has data)
+  badCols.forEach(c=>{
+    const below = rows>1 ? sh.getRange(2,c,rows-1,1).getValues() : [];
+    const hasData = below.some(r => String(r[0]||'').trim()!=='');
+    if (hasData) toMove.push(c); else toDelete.push(c);
+  });
+
+  // Move non-empty unexpected columns to backup sheet (with data), preserving values
+  if (toMove.length){
+    backup.getRange(br,1).setValue('Moved unexpected columns (header + data):');
+    br++;
+    toMove.slice().reverse().forEach(c=>{
+      const colVals = sh.getRange(1,c,rows,1).getValues(); // includes header
+      backup.getRange(br,1,rows,1).setValues(colVals);
+      const hdr = String(colVals[0][0]||'');
+      backup.getRange(br,2,1,1).setValue('from col '+c+' ('+hdr+')');
+      br += rows + 1;
+    });
+  }
+
+  // Delete from right to left to avoid index shifting
+  [...toMove, ...toDelete].sort((a,b)=>b-a).forEach(c=> sh.deleteColumn(c));
+
+  // Rewrite headers exactly to expected (and re-freeze)
+  sh.getRange(1,1,1,expected.length).setValues([expected]);
+  if (sh.getLastColumn() > expected.length){
+    // if anything remains to the right (rare), clear row 1 past expected
+    sh.getRange(1, expected.length+1, 1, sh.getLastColumn()-expected.length).clearContent();
+  }
+  sh.setFrozenRows(1);
+
+  // Add a lightweight protection to row 1 (optional, remove if you don’t want this)
+  try{
+    const p = sh.protect().setDescription('Protect PCL header row (Repair_PCL_Headers)');
+    const ranges = p.getRanges().filter(r => r.getRow()!==1); // keep only non-header protections
+    p.remove();
+    const prot = sh.getRange(1,1,1,expected.length).protect().setDescription('PCL headers');
+    prot.removeEditors(prot.getEditors());
+    prot.setWarningOnly(true); // warn, do not block (safer for ops)
+  }catch(_){}
+
+  Logger.log('Repair complete. Removed/relocated unexpected headers: ' + badCols.join(', '));
+}
+
+/** (Optional) Hardener: use this in future if you ever rework header mapping.
+ * It ignores cells like "#NUM!" and only maps known expected headers.
+ */
+function hdrIndexStrict_(sh, expectedList){
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const row = sh.getRange(1,1,1,lastCol).getValues()[0] || [];
+  const allowed = new Set(expectedList || []);
+  const map = {};
+  for (let i=0;i<row.length;i++){
+    const v = String(row[i]||'').trim();
+    if (!v) continue;
+    if (!allowed.size || allowed.has(v)) map[v] = i;
+  }
+  return map;
+}
+
