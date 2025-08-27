@@ -1,0 +1,725 @@
+/** =============================================================================
+ * PORT CITY LUGGAGE — OPS DASHBOARD (Sheets + Apps Script)
+ * Manifest builder with Extras columns and driver-friendly views
+ * =============================================================================
+ *
+ * TABLE OF CONTENTS
+ *  0)  Config & constants
+ *  1)  Menu & “Run” wrappers
+ *  2)  Setup helpers (creates tabs, headers, validations scaffold)
+ *  3)  Manifest helpers
+ *      3.1 writeHeaders_
+ *      3.2 applyValidationAndFormats_
+ *      3.3 buildFilterViews_
+ *      3.3b _autoResizeWithPad_
+ *      3.4 _indexMap_, _listDriverNames_
+ *  4)  Actions (build manifest for Today/Tomorrow/Picked Date)
+ *  5)  Bookings reader (row → object)
+ *  6)  Utilities (dates/formatting/extras parsing/row composer)
+ * =============================================================================
+ */
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 0) CONFIG & CONSTANTS
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+const CFG = {
+  // ---- Sheet names
+  SHEET_BOOKINGS : 'PCL_Bookings',
+  SHEET_MANIFEST : 'Manifest',
+  SHEET_DRIVERS  : 'Drivers',
+
+  // ---- Time & grouping
+  TIMEZONE       : 'America/New_York',
+  BLOCK_MIN      : 15, // manifest time block size
+
+  // ---- Status list + colors
+  STATUSES       : ['Pending','Paid','Dispatched','Complete','Canceled'],
+  STATUS_COLORS  : {
+    Pending    : { bg:'#fff7ed', text:'#7c2d12' },  // orange-50
+    Paid       : { bg:'#ecfeff', text:'#164e63' },  // cyan-50
+    Dispatched : { bg:'#eef2ff', text:'#3730a3' },  // indigo-50
+    Complete   : { bg:'#ecfdf5', text:'#065f46' },  // green-50
+    Canceled   : { bg:'#fee2e2', text:'#7f1d1d' },  // red-200
+  },
+
+  // ---- Bookings header mapping (exact header text in Bookings sheet)
+  BOOKING_HEADERS: {
+    booking_id      : 'booking_id',
+    customer_name   : 'customer_name',
+    phone           : 'phone',
+    email           : 'email',
+    bags            : 'bags',
+    days            : 'days',
+    pickup_addr     : 'pickup_addr',
+    pickup_time_iso : 'pickup_time_iso',
+    dropoff_addr    : 'dropoff_addr',
+    dropoff_time_iso: 'dropoff_time_iso',
+    curbside        : 'curbside',
+    ride            : 'ride',
+    ride_people     : 'ride_people',
+    priority        : 'priority',
+    payment_status  : 'status',     // your sheet stores payment status in "status"
+    notes           : 'notes',
+    // Optional (safe if blank)
+    base_label      : 'base_label',
+    flight_airline  : 'flight_airline',
+    flight_number   : 'flight_number',
+    // Extras
+    addons_json     : 'addons_json',
+    extras_flat     : 'extras_flat',
+  },
+};
+
+// === Add-ons (widget id -> Manifest column header) ===
+const EXTRAS_SKUS = [
+  { id:'charger',  header:'Charger' },
+  { id:'socks',    header:'Socks' },
+  { id:'earbuds',  header:'Earbuds' },
+  { id:'tooth',    header:'Tooth Kit' },
+  { id:'carry40',  header:'Carry 40L' },
+  { id:'beanbag',  header:'Beanbag Tote' },
+  { id:'locks',    header:'TSA Locks' },
+  { id:'tags',     header:'Tags (2-pack)' },
+  { id:'neck',     header:'Neck Pillow' },
+];
+
+// ---- Manifest headers (column order)
+const MANIFEST_HEADERS = [
+  'Time Block',
+  'Type',
+  'Customer',
+  'Base Pass',
+  "X's",
+  'Bags',
+  'Window',
+  'Date',              // ← NEW
+  'Address',
+  'Driver',
+  'Status',
+  'Phone',
+  'Booking ID',
+  'Flight',
+  'Priority',
+  'Ride (seats)',
+  'Curbside',
+  'Notes',
+  'Extras (summary)',
+  ...EXTRAS_SKUS.map(x => x.header),
+];
+
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 1) MENU & “RUN” WRAPPERS
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Port City Luggage')
+    .addItem('Build Manifest (Today)',      'Actions.buildToday')
+    .addItem('Build Manifest (Tomorrow)',   'Actions.buildTomorrow')
+    .addItem('Build Manifest (Pick Date)',  'Actions.buildPickDate')
+    .addSeparator()
+    .addItem('Rebuild (same date)',         'Actions.rebuildSameDate')
+    .addSeparator()
+    .addItem('Install / Repair',            'Install')
+    .addToUi();
+}
+
+// Run-menu helpers
+function Install(){ Setup.install(); }
+function BuildManifestToday(){ Actions.buildForDay_(0); }
+function BuildManifestTomorrow(){ Actions.buildForDay_(1); }
+function BuildManifestPickDate(){ Actions.pickDateAndBuild_(); }
+function RebuildManifestSameDate(){ Actions.rebuildSameDate_(); }
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 2) SETUP HELPERS
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+const Setup = {
+  install(){
+    const ss = SpreadsheetApp.getActive();
+    let bookings = ss.getSheetByName(CFG.SHEET_BOOKINGS);
+    let manifest = ss.getSheetByName(CFG.SHEET_MANIFEST);
+    let drivers  = ss.getSheetByName(CFG.SHEET_DRIVERS);
+
+    if (!bookings) bookings = ss.insertSheet(CFG.SHEET_BOOKINGS);
+    if (!manifest) manifest = ss.insertSheet(CFG.SHEET_MANIFEST);
+    if (!drivers)  drivers  = ss.insertSheet(CFG.SHEET_DRIVERS);
+
+    // Drivers headers (first-time)
+    if (drivers.getLastRow() === 0){
+      drivers.getRange(1,1,1,3).setValues([['Driver Name','Phone','Notes']]);
+      drivers.setFrozenRows(1);
+    }
+
+    // Manifest scaffold (no auto-resize here; we do a single resize at the end of a build)
+    Manifest.writeHeaders_(manifest);
+    Manifest.buildFilterViews_(manifest, ss);
+
+    const msg = 'Install complete. Use the “Port City Luggage” menu in the sheet to build a manifest.';
+    try { SpreadsheetApp.getUi().alert(msg); }
+    catch(_) { SpreadsheetApp.getActive().toast(msg); }
+  },
+};
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 3) MANIFEST HELPERS
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+const Manifest = {
+  /* 3.1 — Write header row and basic sheet formatting */
+  writeHeaders_(sheet){
+  // Ensure we have enough columns for the manifest
+  const needCols = MANIFEST_HEADERS.length;
+  const haveCols = sheet.getMaxColumns();
+  if (haveCols < needCols) {
+    sheet.insertColumnsAfter(haveCols, needCols - haveCols);
+  }
+
+  // Clear all contents (keep filters/column widths if any)
+  const maxRows = Math.max(sheet.getMaxRows(), 2);
+  const maxCols = sheet.getMaxColumns();
+  sheet.getRange(1, 1, maxRows, maxCols).clearContent();
+
+  // Write header row
+  sheet.getRange(1, 1, 1, MANIFEST_HEADERS.length).setValues([MANIFEST_HEADERS]);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, MANIFEST_HEADERS.length).setFontWeight('bold');
+
+  // Base alignment
+  sheet.getDataRange().setHorizontalAlignment('center');
+},
+
+
+  /* 3.2 — Apply data validation and status colors */
+applyValidationAndFormats_(manifestSheet){
+  const headerIdx = this._indexMap_();
+
+  // 1) Nuke EVERY validation on the sheet (full grid, not just dataRange)
+  const maxRows = manifestSheet.getMaxRows();
+  const maxCols = manifestSheet.getMaxColumns();
+  manifestSheet.getRange(1, 1, maxRows, maxCols).clearDataValidations();
+
+  // 2) STATUS validation (the only one we keep)
+  const ruleStatus = SpreadsheetApp.newDataValidation()
+    .requireValueInList(CFG.STATUSES, true)
+    .setAllowInvalid(false)
+    .build();
+  manifestSheet
+    .getRange(2, headerIdx['Status'], maxRows - 1, 1)
+    .setDataValidation(ruleStatus)
+    .setNumberFormat('@STRING@');
+
+  // Status colors
+  const rules = [];
+  CFG.STATUSES.forEach(st => {
+    const c = CFG.STATUS_COLORS[st] || { bg:'#ffffff', text:'#000000' };
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo(st)
+        .setBackground(c.bg)
+        .setFontColor(c.text)
+        .setRanges([ manifestSheet.getRange(2, headerIdx['Status'], maxRows - 1, 1) ])
+        .build()
+    );
+  });
+  manifestSheet.setConditionalFormatRules(rules);
+
+  // Presentation
+  manifestSheet.setFrozenRows(1);
+},
+
+
+  /* 3.3 — Build filter views (Advanced Sheets API) */
+  buildFilterViews_(manifestSheet, ss){
+    const ssId    = ss.getId();
+    const sheetId = manifestSheet.getSheetId();
+
+    // Remove old “All Jobs” / “Driver • …” views
+    let toDelete = [];
+    try {
+      const meta = SheetsAdvanced.Spreadsheets.get(ssId, {
+        fields: 'sheets(properties(sheetId),filterViews(filterViewId,title,range))'
+      });
+      (meta.sheets || []).forEach(s => {
+        if (!s.properties || s.properties.sheetId !== sheetId) return;
+        (s.filterViews || []).forEach(v => {
+          const t = String(v.title || '');
+          if (t === 'All Jobs' || t.startsWith('Driver • ')) {
+            toDelete.push({ deleteFilterView: { filterId: v.filterViewId }});
+          }
+        });
+      });
+      if (toDelete.length) SheetsAdvanced.Spreadsheets.batchUpdate({ requests: toDelete }, ssId);
+    } catch(_) {}
+
+    // Add fresh views
+    const requests = [];
+    requests.push({
+      addFilterView: {
+        filter: {
+          title: 'All Jobs',
+          range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: MANIFEST_HEADERS.length },
+          criteria: {}
+        }
+      }
+    });
+
+    const drivers = this._listDriverNames_();
+    const driverColIndex0 = this._indexMap_()['Driver'] - 1; // 0-based
+    drivers.forEach(name => {
+      if (!name) return;
+      requests.push({
+        addFilterView: {
+          filter: {
+            title: `Driver • ${name}`,
+            range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: MANIFEST_HEADERS.length },
+            criteria: {
+              [String(driverColIndex0)]: {
+                condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: name }] }
+              }
+            }
+          }
+        }
+      });
+    });
+
+    if (requests.length) SheetsAdvanced.Spreadsheets.batchUpdate({ requests }, ssId);
+  },
+
+  /* 3.3b — Auto-resize with padding (run once at end of build) */
+  _autoResizeWithPad_(sheet){
+    const last = MANIFEST_HEADERS.length;
+
+    // Let Sheets decide first…
+    sheet.autoResizeColumns(1, last);
+
+    // …then add padding and minimums.
+    const PAD_PX = 40;
+    const MIN = {
+      'Time Block':        160,
+      'Type':              130,
+      'Customer':          180,
+      'Base Pass':         120,
+      "X's":                50,
+      'Bags':               70,
+      'Window':            130,
+      'Date':              110,  // NEW
+      'Address':           340,
+      'Driver':            120,
+      'Status':            110,
+      'Phone':             110,
+      'Booking ID':        140,
+      'Flight':            120,
+      'Priority':           90,
+      'Ride (seats)':      120,
+      'Curbside':          100,
+      'Notes':             220,
+      'Extras (summary)':  280
+    };
+
+    for (let c = 1; c <= last; c++){
+      const header = MANIFEST_HEADERS[c-1];
+      const cur = sheet.getColumnWidth(c);
+      const min = MIN[header] || 0;
+      sheet.setColumnWidth(c, Math.max(cur + PAD_PX, min));
+    }
+  },
+
+  /* 3.4 — Small helpers */
+  _indexMap_(){
+    const m = {};
+    MANIFEST_HEADERS.forEach((h,i)=>{ m[h]=i+1; });
+    return m;
+  },
+
+  _listDriverNames_(){
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName(CFG.SHEET_DRIVERS);
+    if (!sh) return [];
+    if (sh.getLastRow() < 2) return [];
+    const vals = sh.getRange(2,1, sh.getLastRow()-1, 1).getValues().flat();
+    return vals.map(v=>String(v||'').trim()).filter(Boolean);
+  },
+};
+
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 4) ACTIONS — build manifest for a given day
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+const Actions = {
+  buildToday()       { return this.buildForDay_(0); },
+  buildTomorrow()    { return this.buildForDay_(1); },
+  buildPickDate()    { return this.pickDateAndBuild_(); },
+  rebuildSameDate()  { return this.rebuildSameDate_(); },
+
+  buildForDay_(offsetDays){
+    const today = new Date();
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    d.setDate(d.getDate() + (offsetDays|0));
+    this._buildForDate_(d);
+  },
+
+  pickDateAndBuild_(){
+    const ui = SpreadsheetApp.getUi();
+    const res = ui.prompt('Build Manifest for which date? (YYYY-MM-DD)', ui.ButtonSet.OK_CANCEL);
+    if (res.getSelectedButton() !== ui.Button.OK) return;
+    const s = (res.getResponseText()||'').trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (!m){ ui.alert('Please enter a date like 2025-08-19'); return; }
+    const d = new Date(Number(m[1]), Number(m[2])-1, Number(m[3]));
+    this._buildForDate_(d);
+  },
+
+  rebuildSameDate_(){
+    this.buildForDay_(0);
+  },
+
+  _buildForDate_(dayDate){
+    const ss = SpreadsheetApp.getActive();
+    const bookings = ss.getSheetByName(CFG.SHEET_BOOKINGS);
+    const manifest = ss.getSheetByName(CFG.SHEET_MANIFEST);
+    const drivers  = ss.getSheetByName(CFG.SHEET_DRIVERS);
+    if (!bookings || !manifest) {
+      SpreadsheetApp.getUi().alert('Missing Bookings or Manifest sheet');
+      return;
+    }
+
+    // Fresh sheet scaffold (no auto-resize here)
+Manifest.writeHeaders_(manifest);
+
+// Clear ALL prior formatting (backgrounds, bold, borders, number formats) for data rows
+// (Header styling stays because we reapply it in writeHeaders_)
+if (manifest.getMaxRows() > 1) {
+  manifest.getRange(2, 1, manifest.getMaxRows() - 1, manifest.getMaxColumns()).clearFormat();
+}
+
+// Reapply validations & status coloring after clearing formats
+Manifest.applyValidationAndFormats_(manifest);
+
+
+
+    const rows = Bookings.readAllAsObjects_(bookings);
+
+    // Filter to date (pickup OR dropoff on that date)
+    const targetY = dayDate.getFullYear();
+    const targetM = dayDate.getMonth();
+    const targetD = dayDate.getDate();
+
+    const jobs = [];
+
+    rows.forEach(bk => {
+      const pu = parseIso_(bk.pickup_time_iso);
+      if (pu && sameLocalDate_(pu, targetY, targetM, targetD)) {
+        jobs.push(jobFromBooking_(bk, 'Pickup', pu));
+      }
+      const doIso = parseIso_(bk.dropoff_time_iso);
+      if (doIso && sameLocalDate_(doIso, targetY, targetM, targetD)) {
+        let type = 'Delivery';
+        if (asBool_(bk.ride))     type = 'Ride Pickup';
+        if (asBool_(bk.curbside)) type = 'Curbside Handoff';
+        jobs.push(jobFromBooking_(bk, type, doIso));
+      }
+    });
+
+    // Sort by block then type
+    jobs.sort((a,b)=>{
+      if (a.blockStart !== b.blockStart) return a.blockStart - b.blockStart;
+      return String(a.type).localeCompare(String(b.type));
+    });
+
+    // Write to Manifest
+    const headerIdx = Manifest._indexMap_();
+    const out = [];
+
+    jobs.forEach(j => {
+      const row = new Array(MANIFEST_HEADERS.length).fill('');
+      row[headerIdx['Time Block']-1]   = j.blockLabel;
+      row[headerIdx['Type']-1]         = j.type;
+      row[headerIdx['Customer']-1]     = j.customer;
+      row[headerIdx['Base Pass']-1]    = j.baseLabel || '';
+      row[headerIdx["X's"]-1]          = j.hasExtras ? 'x' : '';   // NEW: extras flag
+      row[headerIdx['Bags']-1]         = j.bags;
+      row[headerIdx['Window']-1]       = j.windowLabel;
+      row[headerIdx['Date']-1]         = j.dateLabel;   // NEW
+      row[headerIdx['Address']-1]      = j.address;
+      row[headerIdx['Driver']-1]       = ''; // assign later
+      row[headerIdx['Status']-1]       = normalizeStatus_(j.payment_status);
+      row[headerIdx['Phone']-1]        = j.phone;
+      row[headerIdx['Booking ID']-1]   = j.booking_id;
+      row[headerIdx['Flight']-1]       = j.flight || '';
+      row[headerIdx['Priority']-1]     = j.priority ? 'Yes' : '';
+      row[headerIdx['Ride (seats)']-1] = j.ride_people || (j.ride ? 'Yes' : '');
+      row[headerIdx['Curbside']-1]     = j.curbside ? 'Yes' : '';
+      row[headerIdx['Notes']-1]        = j.notes || '';
+
+      // Extras — only on the drop-off/return line
+      row[headerIdx['Extras (summary)']-1] = (j.type === 'Pickup' || j.type === 'Ride Pickup') ? '' : j.extrasSummary;
+      EXTRAS_SKUS.forEach(sku=>{
+        const n = Number(j.extrasCounts[sku.id] || 0);
+        row[headerIdx[sku.header]-1] = (j.type === 'Pickup' || j.type === 'Ride Pickup') ? '' : (n > 0 ? n : '');
+      });
+
+      out.push(row);
+    });
+
+    // Clear any previous data rows
+const oldMaxRows = Math.max(0, manifest.getMaxRows() - 1);
+if (oldMaxRows > 0) {
+  manifest.getRange(2, 1, oldMaxRows, manifest.getMaxColumns()).clearContent();
+}
+
+// Make sure we have enough rows to write
+const neededRows = out.length + 1; // header + data
+if (manifest.getMaxRows() < neededRows) {
+  manifest.insertRowsAfter(manifest.getMaxRows(), neededRows - manifest.getMaxRows());
+}
+
+if (out.length){
+  manifest.getRange(2,1,out.length,MANIFEST_HEADERS.length).setValues(out);
+}
+
+
+    // Row-level visual formatting (type colors, bag bold, near-term time blocks)
+    applyRowVisuals_(manifest, jobs, headerIdx);
+
+    // Filter views after data is present
+    Manifest.buildFilterViews_(manifest, ss);
+
+    SpreadsheetApp.getActive().toast(`Manifest built for ${dayDate.toDateString()} — ${out.length} rows`);
+  },
+};
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 5) BOOKINGS READER — returns array of objects keyed by CFG.BOOKING_HEADERS
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+const Bookings = {
+  readAllAsObjects_(sheet){
+    if (sheet.getLastRow() < 2) return [];
+    const values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
+    const header = values.shift().map(h => String(h||'').trim());
+
+    const map = CFG.BOOKING_HEADERS;
+    const idx = {};
+    Object.keys(map).forEach(k=>{
+      idx[k] = header.indexOf(map[k]);
+    });
+
+    const out = [];
+    values.forEach(row => {
+      const o = {};
+      Object.keys(idx).forEach(k=>{
+        const i = idx[k];
+        o[k] = i >= 0 ? row[i] : '';
+      });
+
+      // Normalize strings
+      [
+        'booking_id','customer_name','phone','email',
+        'pickup_addr','dropoff_addr','payment_status','notes',
+        'base_label','flight_airline','flight_number',
+        'ride_people','extras_flat','addons_json'
+      ].forEach(k=>{
+        o[k] = typeof o[k] === 'string' ? o[k].trim() : o[k];
+      });
+
+      out.push(o);
+    });
+    return out;
+  },
+};
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 6) UTILITIES — dates, formatting, extras parsing, row composer
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+// Center/visual tweaks per row after data write
+function applyRowVisuals_(sheet, jobs, idx){
+  const startRow = 2;
+  const now = new Date();
+  const nowNY = new Date(Utilities.formatDate(now, CFG.TIMEZONE, "yyyy-MM-dd'T'HH:mm:ssZ")); // normalize
+  const twoHoursMs = 2 * 60 * 60 * 1000;
+
+  const colTime   = idx['Time Block'];
+  const colType   = idx['Type'];
+  const colBags   = idx['Bags'];
+
+  const yellow = '#fff9c4'; // light yellow
+  const blue   = '#e0f2fe'; // light blue
+  const redLt  = '#fee2e2'; // light red
+
+  jobs.forEach((j, i)=>{
+    const r = startRow + i;
+
+    // Type coloring (any "Pickup" variant = yellow; others = blue)
+    const typeRange = sheet.getRange(r, colType);
+    if (String(j.type || '').toLowerCase().includes('pickup')) {
+      typeRange.setBackground(yellow);
+    } else {
+      typeRange.setBackground(blue);
+    }
+
+    // Bags bold when >=6
+    const bagsRange = sheet.getRange(r, colBags);
+    const nBags = Number(j.bags || 0);
+    if (nBags >= 6) bagsRange.setFontWeight('bold');
+
+    // Time Block cell red if within 2 hours from now (NY time)
+    const timeRange = sheet.getRange(r, colTime);
+    const diff = j.blockStart - nowNY.getTime(); // future-only
+    if (diff >= 0 && diff <= twoHoursMs) {
+    timeRange.setBackground(redLt);
+}
+
+  });
+
+  // Keep columns sized and center aligned (single resize per build)
+  sheet.getDataRange().setHorizontalAlignment('center');
+  Manifest._autoResizeWithPad_(sheet);
+}
+
+function asBool_(v){
+  if (typeof v === 'boolean') return v;
+  const s = String(v||'').toLowerCase().trim();
+  return ['true','yes','y','1'].includes(s);
+}
+
+function parseIso_(v){
+  if (!v) return null;
+  try {
+    const d = new Date(v); // Apps Script Date parses ISO w/ TZ
+    if (isNaN(d.getTime())) return null;
+    return d;
+  } catch(_) { return null; }
+}
+
+function sameLocalDate_(d, y, m, day){
+  return d.getFullYear() === y && d.getMonth() === m && d.getDate() === day;
+}
+
+function toBlockLabel_(d){
+  const start = new Date(d);
+  start.setMinutes(Math.floor(start.getMinutes()/CFG.BLOCK_MIN)*CFG.BLOCK_MIN, 0, 0);
+  const end = new Date(start.getTime() + CFG.BLOCK_MIN*60*1000);
+  return { start, label: `${fmtTime_(start)}–${fmtTime_(end)}` };
+}
+
+function fmtTime_(d){
+  return Utilities.formatDate(d, CFG.TIMEZONE, 'h:mm a');
+}
+
+function windowLabel_(d){
+  const end = new Date(d.getTime() + 15*60*1000); // widget’s 15-min windows
+  return `${fmtTime_(d)}–${fmtTime_(end)}`;
+}
+
+function normalizeStatus_(paymentStatus){
+  const s = String(paymentStatus||'').toLowerCase();
+  if (s.includes('cancel'))   return 'Canceled';
+  if (s.includes('complete')) return 'Complete';
+  if (s.includes('dispatch')) return 'Dispatched';
+  if (s.includes('paid'))     return 'Paid';
+  return 'Pending';
+}
+
+
+// ---- Extras parsing helpers
+function parseAddonsJson_(cellValue){
+  if (!cellValue) return [];
+  try {
+    const v = (typeof cellValue === 'string') ? JSON.parse(cellValue) : cellValue;
+    return Array.isArray(v) ? v : [];
+  } catch(_) { return []; }
+}
+function extrasToCounts_(addons){
+  const m = {};
+  addons.forEach(a=>{
+    const id = String(a && a.id || '').trim();
+    if (!id) return;
+    m[id] = (m[id] || 0) + 1;
+  });
+  return m;
+}
+function extrasSummary_(addons){
+  if (!Array.isArray(addons) || !addons.length) return '';
+  const ABBR = { 'ride_pwm_1_2': 'R2', 'ride_pwm_3_4': 'R4', 'pwm_curb': 'CSD' };
+
+  const out = addons.map(a => {
+    const id = String(a && a.id || '').trim();
+    const label = String(a && (a.label || a.id) || '').trim();
+    if (ABBR[id]) return ABBR[id];
+    const L = label.toLowerCase();
+    if (L.includes('ride') && (L.includes('1-2') || L.includes('1–2'))) return 'R2';
+    if (L.includes('ride') && (L.includes('3-4') || L.includes('3–4'))) return 'R4';
+    if (L.includes('curb') && L.includes('pwm')) return 'CSD';
+    // default: strip “Extra …” cosmetics
+    return label.replace(/^extra\s*•?\s*/i,'').trim();
+  });
+
+  return out.join(', ');
+}
+
+function removeOldValidationsEverywhere(){
+  const ss = SpreadsheetApp.getActive();
+  ss.getSheets().forEach(sh => sh.getDataRange().clearDataValidations());
+}
+
+
+// ---- Build a job row object for a single booking+window
+function jobFromBooking_(bk, type, isoDate){
+  // Base block (rounded to CFG.BLOCK_MIN)
+  const baseBlock = toBlockLabel_(isoDate);
+
+  // Priority pickups: shift the *displayed & sort* time block 1 minute earlier
+  let blockStart = baseBlock.start.getTime();
+  let startForLabel = new Date(baseBlock.start);
+  let endForLabel   = new Date(startForLabel.getTime() + CFG.BLOCK_MIN*60*1000);
+
+  if (type === 'Pickup' && asBool_(bk.priority)) {
+    startForLabel = new Date(startForLabel.getTime() - 60*1000);
+    endForLabel   = new Date(endForLabel.getTime()   - 60*1000);
+    blockStart    = startForLabel.getTime(); // affects sort/“near-term” checks too
+  }
+
+  const addons = parseAddonsJson_(bk.addons_json);
+  const counts = extrasToCounts_(addons);
+  const flight = [bk.flight_airline||'', bk.flight_number||''].filter(Boolean).join(' ').trim();
+  const hasExtras = Array.isArray(addons) && addons.length > 0;
+
+    return {
+    type,
+    blockStart,
+    blockLabel   : `${fmtTime_(startForLabel)}–${fmtTime_(endForLabel)}`,
+    windowLabel  : windowLabel_(isoDate),
+    dateLabel : Utilities.formatDate(isoDate, CFG.TIMEZONE, 'EEE M/d'),
+    booking_id   : bk.booking_id || '',
+    customer     : bk.customer_name || '',
+    baseLabel    : bk.base_label || '',
+    bags         : bk.bags || '',
+    address      : (type === 'Pickup') ? (bk.pickup_addr||'') : (bk.dropoff_addr||''),
+    phone        : bk.phone || '',
+    notes        : bk.notes || '',
+    payment_status: bk.payment_status || '',
+    priority     : asBool_(bk.priority),
+    ride         : asBool_(bk.ride),
+    ride_people  : bk.ride_people || '',
+    curbside     : asBool_(bk.curbside),
+    flight,
+    hasExtras,                      // NEW
+    // extras shown only on drop-off row (enforced during write)
+    extrasSummary: extrasSummary_(addons),
+    extrasCounts : counts,
+  };
+}
+
