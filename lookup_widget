@@ -1,0 +1,539 @@
+<!-- =============================================================================
+   PORT CITY LUGGAGE — FIND / MANAGE BOOKING WIDGET  (v1.2 • 2025-08-21)
+   - Polished Apple-Wallet-style cards, hover bumps & soft shadows
+   - Slim progress bar + button spinner while fetching
+   - Friendly error messages (e.g., auth_failed → “email didn’t match this booking”)
+   - Uses read-only Apps Script via Netlify proxy (fn: manage_lookup)
+   ============================================================================ -->
+
+<div id="pcl-manage"></div>
+
+<style>
+  :root{
+    --blue:#0b2e66;
+    --blue-500:#184a9a;
+    --muted:#6b7280;
+    --border:#e6e8ec;
+    --bg:#f5f7fb;
+    --err:#b00020;
+    --ok:#065f46;
+    --white:#fff;
+  }
+
+  #pcl-manage{
+    max-width:920px;
+    margin:0 auto;
+    padding:12px 0 32px;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter;
+    color:#111315;
+  }
+
+  /* --- Apple Wallet-ish pass --- */
+  .pcl-pass{
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.9), rgba(255,255,255,.9)),
+      var(--white);
+    border:1px solid var(--border);
+    border-radius:22px;
+    box-shadow:0 12px 28px rgba(17,24,39,.12);
+    overflow:hidden;
+  }
+  .pcl-strap{
+    background:linear-gradient(180deg,#ffffff,#f7f8fb);
+    border-bottom:1px solid var(--border);
+    padding:18px 22px;
+    display:flex;justify-content:space-between;gap:12px;align-items:flex-end;
+  }
+  .pcl-title{font-size:28px;margin:0;letter-spacing:.2px}
+  .pcl-sub{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em}
+
+  .pcl-body{padding:16px 22px 22px}
+
+  /* --- Inputs / rows --- */
+  .pcl-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:720px){.pcl-row{grid-template-columns:1fr}}
+  .pcl-inp{
+    box-sizing:border-box;width:100%;
+    padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:#fff;
+    font-size:16px;outline:none;
+    transition:box-shadow .15s ease, transform .12s ease;
+  }
+  .pcl-inp:focus{box-shadow:0 0 0 3px rgba(11,46,102,.14)}
+  label{font-size:12px;color:var(--muted);display:block;margin:0 0 6px;letter-spacing:.08em;text-transform:uppercase}
+
+  /* --- Button --- */
+  .pcl-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+  .pcl-btn{
+    appearance:none; border:1px solid var(--blue); background:var(--blue); color:#fff;
+    padding:12px 18px;border-radius:12px;font-weight:700;cursor:pointer;
+    transition:transform .12s ease, box-shadow .15s ease, background .15s ease;
+    box-shadow:0 8px 18px rgba(11,46,102,.24);
+  }
+  .pcl-btn:hover{transform:translateY(-1px);box-shadow:0 12px 24px rgba(11,46,102,.28);background:var(--blue-500)}
+  .pcl-btn:active{transform:translateY(0);box-shadow:0 6px 12px rgba(11,46,102,.22)}
+  .pcl-btn:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
+  .pcl-btn.secondary{background:#fff;color:#111;border:1px solid var(--border);box-shadow:0 4px 10px rgba(17,24,39,.06)}
+  .pcl-btn.secondary:hover{transform:translateY(-1px);box-shadow:0 8px 18px rgba(17,24,39,.1)}
+
+  /* Spinner inside button */
+  .pcl-spin{
+    width:16px;height:16px;border-radius:999px;border:2px solid rgba(255,255,255,.38);
+    border-top-color:#fff;display:inline-block;margin-right:8px;vertical-align:-3px;
+    animation:pclSpin .8s linear infinite;
+  }
+  @keyframes pclSpin{to{transform:rotate(360deg)}}
+
+  /* Slim progress bar */
+  .pcl-progress{position:relative;height:3px;background:transparent;overflow:hidden}
+  .pcl-progress .bar{
+    position:absolute;left:0;top:0;height:100%;width:40%;
+    background:linear-gradient(90deg, rgba(11,46,102,.1), rgba(11,46,102,.35), rgba(11,46,102,.1));
+    border-radius:999px;
+    transform:translateX(-60%);
+    animation:pclIndeterminate 1.2s ease-in-out infinite;
+  }
+  @keyframes pclIndeterminate{
+    0%{transform:translateX(-60%)}
+    50%{transform:translateX(20%)}
+    100%{transform:translateX(160%)}
+  }
+
+  /* Info + errors */
+  .pcl-help{font-size:12px;color:var(--muted);margin-top:8px}
+  .pcl-err{color:var(--err);margin-top:8px;font-weight:600}
+  .pcl-ok{color:var(--ok);margin-top:8px}
+
+  /* Summary chips */
+  .pill{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid var(--border);background:#fff;font-weight:700}
+  .pill.paid{color:#065f46;background:#ecfdf5;border-color:#a7f3d0}
+  .pill.pending{color:#92400e;background:#fffbeb;border-color:#fde68a}
+
+  /* Cards */
+  .pcl-card{padding:14px;border:1px solid var(--border);border-radius:14px;background:#fff;box-shadow:0 8px 18px rgba(17,24,39,.06);margin:10px 0}
+  .pcl-kv{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:720px){.pcl-kv{grid-template-columns:1fr}}
+  .pcl-kv .k{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;font-weight:900}
+  .pcl-kv .v{font-size:16px}
+
+  /* Autocomplete list */
+  .pcl-suggest{position:relative}
+  .pcl-suggest-list{position:absolute;left:0;right:0;z-index:50;background:#fff;border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 12px 22px rgba(0,0,0,.10)}
+  .pcl-suggest-item{padding:10px 12px;cursor:pointer}
+  .pcl-suggest-item:hover{background:#f7f7f7}
+
+  .extra-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px;border:1px solid var(--border);border-radius:10px;background:#fff;margin:8px 0}
+  .extra-item h4{margin:0;font-size:15px}
+</style>
+
+<script>
+(function(){
+  /* ====================== CONFIG ====================== */
+  const PROXY_URL    = "https://pcl-proxy-githubdeploy.netlify.app/api/proxy";
+  const MAPBOX_TOKEN = "pk.eyJ1IjoicG9ydGNpdHlsdWdnYWxlIiwiYSI6ImNtZWM5d3NnNjFjajMya29mdzczajhmd3cifQ.eQ9BDd2F1-9wHOn_syMSkg";
+  const SERVICE_ZIPS = ["04101","04102"];
+  const SLOT_MIN     = 15;
+
+  // Read-only backend function routed by the proxy
+  const FN_LOOKUP = "manage_lookup";
+
+  const $root = document.getElementById("pcl-manage");
+
+  /* ====================== UTIL ====================== */
+  const el=(t,a={},...k)=>{const e=document.createElement(t);
+    Object.entries(a||{}).forEach(([x,v])=>{
+      if(x==="class") e.className=v;
+      else if(x==="style") e.style.cssText=v;
+      else if(x.startsWith("on")) e.addEventListener(x.slice(2),v);
+      else if(v!==undefined && v!==null) e.setAttribute(x,v);
+    });
+    k.flat().forEach(n=>{ if(typeof n==="string") e.append(document.createTextNode(n)); else if(n) e.append(n);});
+    return e;
+  };
+  const fmtRange = iso => {
+    if(!iso) return "—";
+    const s=new Date(iso), e=new Date(s.getTime()+SLOT_MIN*60000);
+    return `${s.toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}–${e.toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}`;
+  };
+
+  // Friendly error text for guests
+  function friendlyError(code, details){
+    switch(String(code||"")){
+      case "auth_failed":
+        return "We couldn’t match that Booking ID with that email. Please use the same email you used when booking (check for typos).";
+      case "booking_not_found":
+        return "We couldn’t find a booking with that ID. Double-check the Booking ID and try again.";
+      case "proxy_upstream_error":
+      case "proxy_network_error":
+        return "We couldn’t reach our servers just now. Please try again in a moment.";
+      case "bad_json":
+      case "unknown_fn":
+        return "Something went wrong on our side. Please try again.";
+      default:
+  // TEMP: show full error details during debugging
+  if (details && (details.why || details.message)) {
+    return `Server error: ${details.why || details.message}`;
+  }
+  if (code) return `Server error code: ${code}`;
+  return "We couldn’t complete the lookup. Please try again.";
+
+    }
+  }
+
+  /* ====================== PROXY ====================== */
+  async function proxyPost(fnOrObj, payload){
+    const body = (typeof fnOrObj==="string") ? {fn:fnOrObj, ...(payload||{})} : {...(fnOrObj||{})};
+    if(!body.fn) return { ok:false, error:"proxy_bad_args" };
+    const ctrl = new AbortController(); const to=setTimeout(()=>ctrl.abort("timeout"), 12000);
+    try{
+      const res = await fetch(PROXY_URL, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal:ctrl.signal });
+      const text = await res.text(); let j; try{ j=JSON.parse(text); } catch { j={ ok:false, parse_error:true, raw:text }; }
+      if (!("ok" in j)) j.ok = res.ok;
+      return j;
+    } catch (e){ return { ok:false, error:"proxy_network_error", details:String(e&&e.message||e) }; }
+    finally{ clearTimeout(to); }
+  }
+
+  /* ====================== ADDRESS AUTOCOMPLETE ====================== */
+  function attachAutocomplete(inputEl, zipEl){
+    if (!inputEl || inputEl.dataset.acInit==="1") return;
+    inputEl.dataset.acInit="1";
+    const list = el("div",{class:"pcl-suggest-list",style:"display:none"});
+
+    function mount(){
+      const parent = inputEl.parentNode;
+      if (!parent) { requestAnimationFrame(mount); return; }
+      if (parent.style) parent.style.position="relative";
+      if (!list.parentNode) parent.appendChild(list);
+      wire();
+    }
+
+    function wire(){
+      let timer=null, inflight=null, cache=new Map();
+      function show(items){
+        list.innerHTML=""; if(!items.length){ list.style.display="none"; return; }
+        items.forEach(({label,zip})=>{
+          const it = el("div",{class:"pcl-suggest-item",onclick:()=>{
+            inputEl.value = label; if (zipEl) zipEl.value = (zip||"").slice(0,5);
+            list.style.display="none"; inputEl.dispatchEvent(new Event("change"));
+          }}, label);
+          list.append(it);
+        });
+        list.style.display="block";
+      }
+
+      inputEl.addEventListener("input", ()=>{
+        const q=(inputEl.value||"").trim();
+        clearTimeout(timer); if(q.length<3){ show([]); return; }
+        timer=setTimeout(async ()=>{
+          try{
+            if (inflight) inflight.abort();
+            inflight = new AbortController();
+            let data = cache.get(q);
+            if (!data){
+              const url = new URL(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json`);
+              url.searchParams.set("access_token", MAPBOX_TOKEN);
+              url.searchParams.set("autocomplete","true");
+              url.searchParams.set("country","US");
+              url.searchParams.set("limit","7");
+              const r = await fetch(url.toString(), { signal: inflight.signal, cache:"no-store" });
+              data = await r.json();
+              cache.set(q,data);
+            }
+            const feats = (data && data.features) || [];
+            const out = feats.map(f=>{
+              let zip = (f.properties && f.properties.postcode)||"";
+              if(!zip && Array.isArray(f.context)){
+                const pc = f.context.find(c=>(c.id||"").startsWith("postcode")); if(pc && pc.text) zip=pc.text;
+              }
+              const num = f.address||"", st=(f.text||"").trim();
+              let city="", stc=""; (f.context||[]).forEach(c=>{
+                if((c.id||"").startsWith("place")) city=c.text;
+                if((c.id||"").startsWith("region")) stc = c.short_code ? c.short_code.split("-").pop() : c.text;
+              });
+              const label = [ [num,st].filter(Boolean).join(" "), [city,stc].filter(Boolean).join(", ") ].filter(Boolean).join(", ");
+              return { label, zip: (zip||"").slice(0,5) };
+            }).filter(x=> !x.zip || SERVICE_ZIPS.includes(x.zip));
+            show(out);
+          }catch(_){ show([]); }
+        },300);
+      });
+      inputEl.addEventListener("blur", ()=> setTimeout(()=>{ list.style.display="none"; }, 120));
+    }
+
+    mount();
+  }
+
+  /* ====================== VIEW: LOGIN / LOOKUP ====================== */
+  function loginView(prefillBid){
+    const pass = el("div",{class:"pcl-pass"});
+
+    // top strap
+    pass.append(
+      el("div",{class:"pcl-strap"},
+        el("div",{},
+          el("div",{class:"pcl-sub"},"Port City Luggage"),
+          el("h2",{class:"pcl-title"},"Find your booking")
+        ),
+        el("div",{class:"pcl-sub"}, new Date().toLocaleDateString())
+      ),
+      el("div",{class:"pcl-progress",id:"pcl-progress",style:"display:none"}, el("div",{class:"bar"}))
+    );
+
+    const body = el("div",{class:"pcl-body"});
+    const form = el("form",{id:"pcl-form", onsubmit: async (ev)=>{ ev.preventDefault(); await doLookup(); }});
+
+    const bid = el("input",{id:"pcl-bid",class:"pcl-inp",placeholder:"BKG_XXXX",value:prefillBid||"",autocomplete:"off"});
+    const em  = el("input",{id:"pcl-email",class:"pcl-inp",type:"email",placeholder:"you@example.com",autocomplete:"email"});
+
+    form.append(
+      el("div",{class:"pcl-row"},
+        el("div",{}, el("label",{},"Booking ID"), bid),
+        el("div",{}, el("label",{},"Email (used to book)"), em)
+      )
+    );
+
+    const err  = el("div",{class:"pcl-err",id:"pcl-err",role:"status","aria-live":"polite"});
+    const help = el("div",{class:"pcl-help"},
+      "Tip: use the exact email you used when booking."
+    );
+
+    const btn = el("button",{class:"pcl-btn",id:"pcl-submit",type:"submit"},"Look up booking");
+
+    form.append(el("div",{class:"pcl-actions"}, btn), err, help);
+    body.append(form);
+    pass.append(body);
+
+    // focus first field
+    setTimeout(()=> bid.focus(), 0);
+
+    // local helpers
+    function setLoading(on){
+      document.getElementById("pcl-progress").style.display = on ? "block" : "none";
+      btn.disabled = !!on;
+      if (on){
+        btn.innerHTML = '<span class="pcl-spin"></span>Looking up…';
+      } else {
+        btn.textContent = "Look up booking";
+      }
+    }
+
+    async function doLookup(){
+      err.textContent = "";
+      const booking_id = bid.value.trim();
+      const email = em.value.trim().toLowerCase();
+      if(!booking_id || !/\S+@\S+\.\S+/.test(email)){
+        err.textContent = "Please enter a Booking ID and a valid email.";
+        return;
+      }
+      setLoading(true);
+      try{
+        // tiny delay so progress bar is visible
+        await new Promise(r=>setTimeout(r,120));
+        const j = await proxyPost(FN_LOOKUP,{ booking_id, email });
+        if(!j || !j.ok){
+          const msg = friendlyError(j && j.error, j && j.details);
+          err.textContent = msg;
+          return;
+        }
+        sessionStorage.setItem("pcl_manage_email_"+booking_id, email);
+        renderBooking(j.booking);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    return pass;
+  }
+
+  /* ====================== VIEW: BOOKING DETAILS ====================== */
+  async function renderBooking(b){
+    $root.innerHTML="";
+    const pass = el("div",{class:"pcl-pass"});
+    pass.append(
+      el("div",{class:"pcl-strap"},
+        el("div",{},
+          el("div",{class:"pcl-sub"},"Port City Luggage"),
+          el("h2",{class:"pcl-title"},"Manage your booking")
+        ),
+        el("div",{}, el("span",{class:"pill "+(b.status==="PAID"?"paid":"pending")}, b.status==="PAID"?"PAID":"PENDING"))
+      ),
+      el("div",{class:"pcl-body"},
+        summaryCard(b),
+        addressCard(b),
+        extrasCard(b),
+        el("div",{class:"pcl-actions"},
+          el("button",{class:"pcl-btn secondary",onclick:()=> boot()},"Back / find another"),
+          el("button",{class:"pcl-btn secondary",onclick:()=> refreshBooking(b.booking_id)},"Refresh")
+        )
+      )
+    );
+    $root.append(pass);
+  }
+
+  function summaryCard(b){
+    return el("div",{class:"pcl-card"},
+      el("div",{class:"pcl-kv"},
+        el("div",{}, el("div",{class:"k"},"Customer"), el("div",{class:"v"}, `${b.customer_name} — ${b.email}`)),
+        el("div",{}, el("div",{class:"k"},"Booking ID"), el("div",{class:"v"}, b.booking_id)),
+        el("div",{}, el("div",{class:"k"},"Bags / Days"),  el("div",{class:"v"}, `${b.bags} / ${b.days}`)),
+        el("div",{}, el("div",{class:"k"},"Total Charged"), el("div",{class:"v"}, `$${(b.price_cents/100).toFixed(2)}`)),
+        el("div",{}, el("div",{class:"k"},"Pickup"), el("div",{class:"v"}, `${b.pickup.window} — ${b.pickup.address}`)),
+        el("div",{}, el("div",{class:"k"},"Return / Handoff"), el("div",{class:"v"}, `${b.dropoff.window} — ${b.dropoff.address}`))
+      )
+    );
+  }
+
+  function addressCard(b){
+    const canEdit = !!b.can_edit_dropoff;
+    const note = canEdit
+      ? `Update your return / handoff address below. Changes are allowed until ${b.min_lead_minutes||90} minutes before the window.`
+      : "Address edits are closed for this booking (inside the lead-time window).";
+
+    const wrap = el("div",{class:"pcl-card"});
+    wrap.append(el("h3",{}, "Edit drop-off address"), el("div",{class:"pcl-help"}, note));
+
+    const addr = el("input",{id:"pcl-new-addr",class:"pcl-inp",placeholder:"New drop-off / handoff address",value:b.dropoff.address||"", disabled:!canEdit});
+    const zip  = el("input",{id:"pcl-new-zip", class:"pcl-inp",placeholder:"ZIP (e.g., 04101)", value:(b.dropoff.zip||"").slice(0,5), disabled:!canEdit});
+
+    const row = el("div",{class:"pcl-row"},
+      el("div",{}, el("label",{},"New address"), addr),
+      el("div",{}, el("label",{},"ZIP"), zip)
+    );
+    wrap.append(row);
+    if (canEdit) attachAutocomplete(addr, zip);
+
+    const err  = el("div",{class:"pcl-err"});
+    const ok   = el("div",{class:"pcl-ok",style:"display:none"});
+
+    async function save(){
+      err.textContent=""; ok.style.display="none";
+      const a = (addr.value||"").trim();
+      const z = (zip.value||"").slice(0,5);
+      if(!a || !z){ err.textContent="Please enter an address and ZIP."; return; }
+      const em = sessionStorage.getItem("pcl_manage_email_"+b.booking_id) || b.email;
+      const btn = this;
+      btn.disabled = true; const old = btn.textContent; btn.innerHTML='<span class="pcl-spin"></span>Saving…';
+      try{
+        const j = await proxyPost("manage_update_address",{ booking_id: b.booking_id, email: em, dropoff_addr: a, dropoff_zip: z });
+        if(!j || !j.ok){ err.textContent = friendlyError(j && j.error, j && j.details); return; }
+        ok.textContent = "Saved. Your booking has been updated."; ok.style.display="";
+        refreshBooking(b.booking_id);
+      } finally {
+        btn.disabled = false; btn.textContent = old;
+      }
+    }
+
+    const cta = el("button",{class:"pcl-btn",disabled:!canEdit,onclick:save},"Save new address");
+    wrap.append(el("div",{class:"pcl-actions"}, cta), err, ok);
+    return wrap;
+  }
+
+  function extrasCard(b){
+    const card = el("div",{class:"pcl-card"});
+    card.append(el("h3",{},"Add travel extras (optional)"));
+
+    const chosen = new Set();
+    const listWrap = el("div",{});
+
+    async function loadCatalog(){
+      const j = await proxyPost("manage_catalog");
+      const extras = (j && j.ok && Array.isArray(j.extras)) ? j.extras : [];
+      listWrap.innerHTML="";
+      if (!extras.length){
+        listWrap.append(el("div",{class:"pcl-help"},"No extras available right now."));
+        return;
+      }
+      extras.forEach(x=>{
+        const row = el("div",{class:"extra-item"},
+          el("div",{}, el("h4",{}, x.label), el("div",{class:"pcl-help"}, "$"+(x.amount||0))),
+          (function(){
+            const c = el("input",{type:"checkbox"});
+            c.addEventListener("change",()=>{
+              if(c.checked) chosen.add(x.id); else chosen.delete(x.id);
+              updateCta();
+            });
+            return c;
+          })()
+        );
+        listWrap.append(row);
+      });
+    }
+
+    const err = el("div",{class:"pcl-err"});
+    const cta = el("button",{class:"pcl-btn",disabled:true,onclick:async ()=>{
+      err.textContent="";
+      if (!chosen.size) return;
+      const em = sessionStorage.getItem("pcl_manage_email_"+b.booking_id) || b.email;
+
+      // Build payload from checked rows
+      const chosenItems = [];
+      Array.from(listWrap.querySelectorAll(".extra-item")).forEach(row=>{
+        const label = row.querySelector("h4")?.textContent || "";
+        const price = Number((row.querySelector(".pcl-help")?.textContent || "").replace(/[^0-9.]/g,"")) || 0;
+        const id = label.toLowerCase().replace(/[^\w]+/g,"_").slice(0,40);
+        const checkbox = row.querySelector('input[type="checkbox"]');
+        if (checkbox && checkbox.checked) chosenItems.push({ id, label, amount: price });
+      });
+      if(!chosenItems.length){ err.textContent="Pick at least one item."; return; }
+
+      const old = cta.textContent; cta.disabled=true; cta.innerHTML='<span class="pcl-spin"></span>Starting checkout…';
+      try{
+        const start = await proxyPost("extras_checkout",{ booking_id: b.booking_id, email: em, extras: chosenItems });
+        if(!start || !start.ok || !start.url){ err.textContent=friendlyError(start && start.error, start && start.details); return; }
+        window.location = start.url;
+      } finally {
+        cta.disabled=false; cta.textContent=old;
+      }
+    }},"Checkout selected extras");
+
+    function updateCta(){ cta.disabled = chosen.size===0; }
+
+    card.append(listWrap, el("div",{class:"pcl-actions"}, cta), err);
+    loadCatalog();
+    return card;
+  }
+
+  /* ====================== HELPERS ====================== */
+  async function refreshBooking(bid){
+    const em = sessionStorage.getItem("pcl_manage_email_"+bid) || "";
+    if(!em){ $root.innerHTML=""; $root.append(loginView(bid)); return; }
+    const j = await proxyPost(FN_LOOKUP,{ booking_id: bid, email: em });
+    if (!j || !j.ok){ $root.innerHTML=""; $root.append(loginView(bid)); return; }
+    renderBooking(j.booking);
+  }
+
+  /* ====================== RETURN HANDLER (extras_confirm) ====================== */
+  async function handleExtrasReturn(){
+    const u=new URL(location.href);
+    const bid = u.searchParams.get("b") || document.getElementById("pcl-bid")?.value || "";
+    const paid = u.searchParams.get("paid_extras")==="1";
+    const sid = u.searchParams.get("session_id");
+    if (!paid || !sid || !bid) return;
+
+    $root.innerHTML="";
+    const pass = el("div",{class:"pcl-pass"},
+      el("div",{class:"pcl-strap"},
+        el("div",{}, el("div",{class:"pcl-sub"},"Port City Luggage"), el("h2",{class:"pcl-title"},"Updating your booking…"))
+      ),
+      el("div",{class:"pcl-progress"}, el("div",{class:"bar"})),
+      el("div",{class:"pcl-body"}, el("div",{class:"pcl-help"},"This normally takes just a moment."))
+    );
+    $root.append(pass);
+
+    const j = await proxyPost("extras_confirm",{ booking_id: bid, session_id: sid });
+    try{ u.searchParams.delete("paid_extras"); u.searchParams.delete("session_id"); history.replaceState(null,"",u.toString()); }catch(_){}
+    refreshBooking(bid);
+  }
+
+  /* ====================== BOOT ====================== */
+  function boot(){
+    $root.innerHTML="";
+    const q = new URLSearchParams(location.search);
+    const preBid = q.get("b") || "";
+    $root.append(loginView(preBid));
+    handleExtrasReturn();
+  }
+
+  boot();
+})();
+</script>
