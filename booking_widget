@@ -2859,6 +2859,59 @@ if (!checkoutFresh() && __checkoutInflight){
   try{ await __checkoutInflight; }catch(_){ /* ignore prewarm error */ }
 }
 
+  // ---- Final client-side validation + live slot revalidation ----
+  try{
+    // Basic pickup requirements
+    if (!state.pickupAddress || !state.pickupZip){
+      showToast('Please complete your pickup address.', { variant:'warn' }); setBusy(false); go(2); return;
+    }
+    if (!inService(state.pickupZip)){
+      showToast('Pickup ZIP is not in service area.', { variant:'warn' }); setBusy(false); go(2); return;
+    }
+    if (!state.pickupSlot){
+      showToast('Please select a pickup time.', { variant:'warn' }); setBusy(false); go(2); return;
+    }
+
+    // Second-window logic
+    if (state.ride === true){
+      if (!state.ridePeople){ showToast('Please choose the number of people for the ride.', { variant:'warn' }); setBusy(false); go(2); return; }
+      if (!state.dropoffSlot){ showToast('Please select a ride pickup time.', { variant:'warn' }); setBusy(false); go(2); return; }
+    } else if (state.ride === false){
+      if (state.curbside === null){ showToast('Please choose whether you want airport curbside drop-off.', { variant:'warn' }); setBusy(false); go(2); return; }
+      if (state.curbside === false){
+        if (!state.dropoffAddress || !state.dropoffZip){ showToast('Please enter your return address.', { variant:'warn' }); setBusy(false); go(2); return; }
+        if (!inService(state.dropoffZip)){ showToast('Return ZIP is not in service area.', { variant:'warn' }); setBusy(false); go(2); return; }
+        if (!state.dropoffSlot){ showToast('Please select a return time.', { variant:'warn' }); setBusy(false); go(2); return; }
+      }
+    }
+
+    // Live availability re-check to avoid stale UI vs server (pickup)
+    try{
+      const puDay = (state.pickupSlot || '').slice(0,10);
+      const latestPu = await fetchSlots(puDay, 'pickup', true);
+      const puOk = Array.isArray(latestPu) && latestPu.some(sl => sl && sl.start === state.pickupSlot);
+      if (!puOk){
+        showToast('That pickup time was just taken. Please pick another.', { variant:'warn' });
+        state.pickupSlot = '';
+        setBusy(false); go(2); return;
+      }
+    }catch(_){ /* non-fatal; let server decide */ }
+
+    // Live availability re-check for second window if applicable
+    if (state.curbside !== true && state.dropoffSlot){
+      try{
+        const doDay = (state.dropoffSlot || '').slice(0,10);
+        const latestDo = await fetchSlots(doDay, 'dropoff', true);
+        const doOk = Array.isArray(latestDo) && latestDo.some(sl => sl && sl.start === state.dropoffSlot);
+        if (!doOk){
+          showToast('That second window is no longer available. Please pick another.', { variant:'warn' });
+          state.dropoffSlot = '';
+          setBusy(false); go(2); return;
+        }
+      }catch(_){ /* non-fatal */ }
+    }
+  } catch(_){ /* if anything odd happens, continue to server which will validate */ }
+
 
   try{
     // Ensure booking exists (if user hit reserve immediately on step-4)
@@ -2894,7 +2947,14 @@ if (!checkoutFresh() && __checkoutInflight){
     sessionStorage.setItem('pcl_pending_checkout','1');
     window.location = checkoutRes.url;
   } catch (err){
-    showToast('Sorry—there was a problem starting checkout: ' + String(err), { duration:7000, variant:'warn' });
+    const msg = String((err && err.message) || err || '');
+    if (/slot[_\s-]?full/i.test(msg)){
+      showToast('That time was just taken. Please choose a different time.', { duration:7000, variant:'warn' });
+      try{ clearSlotsCache((state.pickupSlot||'').slice(0,10)); }catch(_){ }
+      setBusy(false); go(2);
+      return;
+    }
+    showToast('Sorry—there was a problem starting checkout: ' + msg, { duration:7000, variant:'warn' });
     setBusy(false);
   }
 }
